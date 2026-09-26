@@ -117,7 +117,12 @@ func savePoolLocked() {
 		return
 	}
 	if err := os.Rename(tmp, poolPath); err != nil {
-		log.Printf("Failed to save accounts: %v", err)
+		// 单文件 bind mount 上 rename 覆盖挂载点会返回 EBUSY，退回原地写。
+		if writeErr := os.WriteFile(poolPath, data, 0600); writeErr != nil {
+			log.Printf("Failed to save accounts: %v", err)
+			return
+		}
+		_ = os.Remove(tmp)
 	}
 }
 
