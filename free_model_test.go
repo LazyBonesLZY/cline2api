@@ -17,6 +17,24 @@ func (f freeModelRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 	return f(req)
 }
 
+// withoutZen 关掉 zen，避免单测在 Cline 池耗尽后连公网。
+// 那次拨号会调用 http.ProxyFromEnvironment，把进程级代理缓存写成「无代理」，
+// 后面的环境变量代理测试就再也看不到 HTTPS_PROXY。
+func withoutZen(t *testing.T) {
+	t.Helper()
+	zenConfigMu.Lock()
+	old := zenConfig
+	disabled := defaultZenConfig()
+	disabled.Enabled = false
+	zenConfig = disabled
+	zenConfigMu.Unlock()
+	t.Cleanup(func() {
+		zenConfigMu.Lock()
+		zenConfig = old
+		zenConfigMu.Unlock()
+	})
+}
+
 func TestCallClineAPIRefreshRetryReplaysRequestBody(t *testing.T) {
 	oldConfig := getProxyConfig()
 	oldTransport := httpClient.Transport
@@ -187,8 +205,8 @@ func TestCallClineAPIFreeRetriesNextGLMAccountAfterTokenRefreshFailure(t *testin
 	if got, want := strings.Join(models, ","), freeModelPrimary; got != want {
 		t.Fatalf("models = %q, want %q", got, want)
 	}
-	if first.Status != "expired" {
-		t.Fatalf("first account status = %q, want expired", first.Status)
+	if first.Status != "cooldown" {
+		t.Fatalf("first account status = %q, want cooldown (refresh 5xx is transient)", first.Status)
 	}
 }
 
@@ -692,6 +710,7 @@ func TestCallClineAPIFreeDoesNotPickCoolingAccount(t *testing.T) {
 	}
 	pool = &AccountPool{Accounts: []*Account{account}}
 	setProxyConfig(defaultProxyConfig())
+	withoutZen(t)
 
 	calls := 0
 	httpClient.Transport = freeModelRoundTripper(func(req *http.Request) (*http.Response, error) {
@@ -907,6 +926,7 @@ func TestHandleResponsesFreeReturnsTooManyRequestsWhenBothPoolsUnavailable(t *te
 	}
 	pool = &AccountPool{Accounts: []*Account{account}}
 	setProxyConfig(defaultProxyConfig())
+	withoutZen(t)
 
 	calls := 0
 	httpClient.Transport = freeModelRoundTripper(func(req *http.Request) (*http.Response, error) {
@@ -1094,5 +1114,90 @@ func TestOnlyFreeConfigRoundTrip(t *testing.T) {
 	setProxyConfig(cfg)
 	if !getProxyConfig().OnlyFree {
 		t.Fatal("OnlyFree not persisted after setProxyConfig")
+	}
+}
+
+func TestParseCooldownUntilUnits(t *testing.T) {
+	cases := []struct {
+		body string
+		want time.Duration
+	}{
+		{`{"message":"Try again in 1h"}`, time.Hour},
+		{`Try again in 1h 1m`, time.Hour + time.Minute},
+		{`Try again in 30m`, 30 * time.Minute},
+		{`Try again in 45 minutes`, 45 * time.Minute},
+		{`Try again in 90s`, 90 * time.Second},
+		{`Try again in 2 hours`, 2 * time.Hour},
+		{`Try again in 1 hour 5 minutes`, time.Hour + 5*time.Minute},
+	}
+	for _, tc := range cases {
+		got := time.Until(parseCooldownUntil(tc.body))
+		if got < tc.want-2*time.Second || got > tc.want+2*time.Second {
+			t.Fatalf("%q => %s, want about %s", tc.body, got, tc.want)
+		}
+	}
+	fallback := time.Until(parseCooldownUntil(`{"error":"quota"}`))
+	if fallback < time.Hour-2*time.Second || fallback > time.Hour+2*time.Second {
+		t.Fatalf("unparsed cooldown => %s, want about 1h", fallback)
+	}
+}
+
+func TestPickAccountForModelLeastUsedRotatesTies(t *testing.T) {
+	oldPool := pool
+	t.Cleanup(func() { pool = oldPool })
+
+	first := &Account{AccountID: "tie-a", Email: "a@example.com", Status: "active"}
+	second := &Account{AccountID: "tie-b", Email: "b@example.com", Status: "active"}
+	pool = &AccountPool{Accounts: []*Account{first, second}}
+
+	var ids []string
+	for i := 0; i < 4; i++ {
+		acc := pickAccountForModelLeastUsed("paid/model")
+		if acc == nil {
+			t.Fatal("expected an account")
+		}
+		ids = append(ids, acc.AccountID)
+	}
+	if ids[0] == ids[1] || ids[1] == ids[2] {
+		t.Fatalf("tied accounts were not rotated: %v", ids)
+	}
+}
+
+func TestCallClineAPIClientErrorDoesNotFallback(t *testing.T) {
+	oldPool := pool
+	oldConfig := getProxyConfig()
+	oldTransport := httpClient.Transport
+	t.Cleanup(func() {
+		pool = oldPool
+		setProxyConfig(oldConfig)
+		httpClient.Transport = oldTransport
+	})
+
+	pool = &AccountPool{Accounts: []*Account{{
+		AccountID:   "direct-account",
+		Email:       "direct@example.com",
+		AccessToken: "direct-token",
+		ExpiresAt:   time.Now().Add(time.Hour).UnixMilli(),
+		Status:      "active",
+	}}}
+	setProxyConfig(defaultProxyConfig())
+
+	calls := 0
+	httpClient.Transport = freeModelRoundTripper(func(req *http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{
+			StatusCode: http.StatusBadRequest,
+			Body:       io.NopCloser(strings.NewReader(`{"error":"bad tools"}`)),
+			Header:     make(http.Header),
+			Request:    req,
+		}, nil
+	})
+
+	_, _, err := callClineAPI(map[string]any{"model": freeModelPrimary}, false)
+	if err == nil {
+		t.Fatal("expected client error")
+	}
+	if calls != 1 {
+		t.Fatalf("upstream calls = %d, want 1 (400 must not walk the fallback chain)", calls)
 	}
 }

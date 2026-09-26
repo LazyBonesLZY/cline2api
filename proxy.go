@@ -798,6 +798,11 @@ func (e *freeModelUnavailableError) Error() string {
 	return e.message
 }
 
+// isUpstreamClientError 判断是否为不应触发模型回退的客户端错误。429 除外，它走冷却换号。
+func isUpstreamClientError(status int) bool {
+	return status >= 400 && status < 500 && status != http.StatusTooManyRequests
+}
+
 func clineErrorHTTPStatus(err error) int {
 	if _, ok := err.(*freeModelUnavailableError); ok {
 		return http.StatusTooManyRequests
@@ -877,8 +882,12 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 				continue
 			}
 			apiErr, ok := err.(*clineAPIError)
+			// 4xx（除 429）是请求本身的问题，换模型只会把参数错误伪装成另一个模型的成功。
+			if ok && isUpstreamClientError(apiErr.statusCode) {
+				return nil, usedAcc, err
+			}
 			if !ok || apiErr.statusCode != http.StatusTooManyRequests {
-				// 非 429 错误：若后面还有候选（provider / 链）则继续降级，否则透传
+				// 5xx 等：若后面还有候选（provider / 链）则继续降级，否则透传
 				if !hasAnyFallbackLeft(model, m) {
 					return nil, usedAcc, err
 				}
@@ -1087,11 +1096,9 @@ func callClineAPIWithAccount(acc *Account, params map[string]any, stream bool) (
 	log.Printf("  upstream: account=%s stream=%v tools=%d msgs=%d max_tokens=%v effort=%v",
 		truncateEmail(acc.Email), stream, toolCount, getMsgCount(params), body["max_tokens"], body["reasoning_effort"])
 
-	resp, err := httpClient.Do(req)
+	resp, err := doUpstream(req, stream)
 	if err != nil {
-		acc.Status = "cooldown"
-		acc.CooldownUntil = time.Now().Add(5 * time.Minute)
-		savePool()
+		markAccountCooldown(acc, time.Now().Add(5*time.Minute))
 		return nil, acc, &clineAccountUnavailableError{err: fmt.Errorf("upstream request: %w", err)}
 	}
 
@@ -1099,25 +1106,22 @@ func callClineAPIWithAccount(acc *Account, params map[string]any, stream bool) (
 		resp.Body.Close()
 		// Refresh token and retry
 		if err := refreshAccountToken(acc); err == nil {
+			poolMu.Lock()
 			token = acc.AccessToken
+			poolMu.Unlock()
 			req.Header = clineHeaders(token, sessionID)
 			req.Body = io.NopCloser(bytes.NewReader(bodyJSON))
-			resp, err = httpClient.Do(req)
+			resp, err = doUpstream(req, stream)
 			if err != nil {
-				acc.Status = "cooldown"
-				acc.CooldownUntil = time.Now().Add(5 * time.Minute)
-				savePool()
+				markAccountCooldown(acc, time.Now().Add(5*time.Minute))
 				return nil, acc, &clineAccountUnavailableError{err: fmt.Errorf("upstream retry: %w", err)}
 			}
 			if resp.StatusCode == 401 {
 				resp.Body.Close()
-				acc.Status = "expired"
-				savePool()
+				markAccountExpired(acc)
 				return nil, acc, &clineAccountUnavailableError{err: fmt.Errorf("account %s token expired permanently", acc.Email)}
 			}
 		} else {
-			acc.Status = "expired"
-			savePool()
 			return nil, acc, &clineAccountUnavailableError{err: fmt.Errorf("account %s refresh failed: %w", acc.Email, err)}
 		}
 	}
@@ -1133,18 +1137,46 @@ func callClineAPIWithAccount(acc *Account, params map[string]any, stream bool) (
 			if model != "" {
 				setModelCooldown(acc, model, until)
 			} else {
-				acc.Status = "cooldown"
-				acc.CooldownUntil = until
-				savePool()
+				markAccountCooldown(acc, until)
 			}
 		}
 		return nil, acc, &clineAPIError{statusCode: resp.StatusCode, message: truncate(bodyStr, 500)}
 	}
 
+	markAccountUsed(acc)
+	return resp, acc, nil
+}
+
+func markAccountCooldown(acc *Account, until time.Time) {
+	if acc == nil {
+		return
+	}
+	poolMu.Lock()
+	acc.Status = "cooldown"
+	acc.CooldownUntil = until
+	savePoolLocked()
+	poolMu.Unlock()
+}
+
+func markAccountExpired(acc *Account) {
+	if acc == nil {
+		return
+	}
+	poolMu.Lock()
+	acc.Status = "expired"
+	savePoolLocked()
+	poolMu.Unlock()
+}
+
+func markAccountUsed(acc *Account) {
+	if acc == nil {
+		return
+	}
+	poolMu.Lock()
 	acc.LastUsed = time.Now()
 	acc.UsageCount++
-	savePool()
-	return resp, acc, nil
+	savePoolLocked()
+	poolMu.Unlock()
 }
 
 type accountTestResult struct {
@@ -1157,24 +1189,45 @@ type accountTestResult struct {
 	Error        string `json:"error,omitempty"`
 }
 
-// parseCooldownUntil 从 429 响应体中解析 "Try again in 1h 1m" 格式的等待时长，
-// 返回预计恢复时间；解析失败则回退到 1 小时后。
-var cooldownRe = regexp.MustCompile(`(?i)try\s+again\s+in\s+(\d+)\s*h?(?:\s*(\d+))?\s*m?`)
+// parseCooldownUntil 从 429 响应体中解析 "Try again in 1h 1m" / "30m" / "90s"。
+// 单位各自识别；解析失败则回退到 1 小时后。
+var (
+	cooldownPhraseRe = regexp.MustCompile(`(?i)try\s+again\s+in\s+([^"\n}]+)`)
+	cooldownHourRe   = regexp.MustCompile(`(?i)(\d+)\s*h(?:ours?|rs?)?`)
+	cooldownMinRe    = regexp.MustCompile(`(?i)(\d+)\s*m(?:in(?:ute)?s?)?`)
+	cooldownSecRe    = regexp.MustCompile(`(?i)(\d+)\s*s(?:ec(?:ond)?s?)?`)
+)
 
 func parseCooldownUntil(body string) time.Time {
-	matches := cooldownRe.FindStringSubmatch(body)
-	if len(matches) >= 2 {
-		hours, _ := strconv.Atoi(matches[1])
-		minutes := 0
-		if len(matches) >= 3 && matches[2] != "" {
-			minutes, _ = strconv.Atoi(matches[2])
-		}
-		if hours > 0 || minutes > 0 {
-			return time.Now().Add(time.Duration(hours)*time.Hour + time.Duration(minutes)*time.Minute)
-		}
+	phrase := body
+	if m := cooldownPhraseRe.FindStringSubmatch(body); len(m) >= 2 {
+		phrase = m[1]
+	} else {
+		return time.Now().Add(time.Hour)
 	}
-	// 解析失败，回退 1 小时
-	return time.Now().Add(1 * time.Hour)
+	d := time.Duration(0)
+	if n := firstDurationNumber(cooldownHourRe, phrase); n > 0 {
+		d += time.Duration(n) * time.Hour
+	}
+	if n := firstDurationNumber(cooldownMinRe, phrase); n > 0 {
+		d += time.Duration(n) * time.Minute
+	}
+	if n := firstDurationNumber(cooldownSecRe, phrase); n > 0 {
+		d += time.Duration(n) * time.Second
+	}
+	if d <= 0 {
+		return time.Now().Add(time.Hour)
+	}
+	return time.Now().Add(d)
+}
+
+func firstDurationNumber(re *regexp.Regexp, phrase string) int {
+	m := re.FindStringSubmatch(phrase)
+	if len(m) < 2 {
+		return 0
+	}
+	n, _ := strconv.Atoi(m[1])
+	return n
 }
 
 // startCooldownRecovery 启动后台 goroutine，每 30 秒检查一次 cooldown 账号，
@@ -1426,7 +1479,7 @@ func modelCooldownActive(acc *Account, model string) bool {
 	}
 	if time.Now().After(until) {
 		delete(acc.ModelCooldowns, model)
-		savePool()
+		savePoolLocked()
 		return false
 	}
 	return true
@@ -1494,6 +1547,7 @@ func handleStreamResponse(w http.ResponseWriter, upstream *http.Response, acc *A
 	reader := bufio.NewReader(upstream.Body)
 	var latestUsage tokenUsage
 	var firstOutputAt time.Time
+	var streamErr error
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
@@ -1501,6 +1555,8 @@ func handleStreamResponse(w http.ResponseWriter, upstream *http.Response, acc *A
 				if line != "" {
 					w.Write([]byte(line + "\n"))
 				}
+			} else {
+				streamErr = err
 			}
 			break
 		}
@@ -1548,7 +1604,11 @@ func handleStreamResponse(w http.ResponseWriter, upstream *http.Response, acc *A
 		flusher.Flush()
 	}
 	recordTokenUsage(acc, reqLog.Model, latestUsage)
-	finalizeRequestLog(reqLog, latestUsage, firstOutputAt, reqLog.StartedAt, true, "")
+	if streamErr != nil {
+		finalizeRequestLog(reqLog, latestUsage, firstOutputAt, reqLog.StartedAt, false, streamErr.Error())
+	} else {
+		finalizeRequestLog(reqLog, latestUsage, firstOutputAt, reqLog.StartedAt, true, "")
+	}
 }
 
 func hasFirstOutput(obj map[string]any) bool {
@@ -2268,10 +2328,14 @@ func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, acc *
 	reader := bufio.NewReader(upstream.Body)
 	var latestUsage tokenUsage
 	var firstOutputAt time.Time
+	var streamErr error
 
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
+			if err != io.EOF {
+				streamErr = err
+			}
 			break
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -2304,6 +2368,7 @@ func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, acc *
 			errBody, _ := json.Marshal(errPayload)
 			log.Printf("  upstream SSE error: %s", string(errBody))
 			emit("error", map[string]any{"type": "error", "error": errPayload})
+			streamErr = fmt.Errorf("upstream SSE error: %s", string(errBody))
 			break
 		}
 
@@ -2474,7 +2539,11 @@ func handleAnthropicStream(w http.ResponseWriter, upstream *http.Response, acc *
 		},
 	})
 	recordTokenUsage(acc, reqLog.Model, latestUsage)
-	finalizeRequestLog(reqLog, latestUsage, firstOutputAt, reqLog.StartedAt, true, "")
+	if streamErr != nil {
+		finalizeRequestLog(reqLog, latestUsage, firstOutputAt, reqLog.StartedAt, false, streamErr.Error())
+	} else {
+		finalizeRequestLog(reqLog, latestUsage, firstOutputAt, reqLog.StartedAt, true, "")
+	}
 
 	emit("message_stop", map[string]any{"type": "message_stop"})
 	log.Printf("  anthropic stream done: hasText=%v tools=%d reason=%s", hasText, len(pendingTools), stopReason)

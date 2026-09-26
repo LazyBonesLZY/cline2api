@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
@@ -12,10 +13,10 @@ import (
 )
 
 const (
-	workosClientID       = "client_01K3A541FN8TA3EPPHTD2325AR"
-	workosDeviceAuthURL  = "https://api.workos.com/user_management/authorize/device"
+	workosClientID        = "client_01K3A541FN8TA3EPPHTD2325AR"
+	workosDeviceAuthURL   = "https://api.workos.com/user_management/authorize/device"
 	workosAuthenticateURL = "https://api.workos.com/user_management/authenticate"
-	clineAPIBase         = "https://api.cline.bot/api/v1"
+	clineAPIBase          = "https://api.cline.bot/api/v1"
 )
 
 type credentials struct {
@@ -209,6 +210,20 @@ func registerWithCline(workosAccess, workosRefresh string) (*clineAuthResp, erro
 	return &c, nil
 }
 
+// refreshAuthError 表示 refreshToken 已被上游拒绝（凭据失效），不是网络抖动。
+type refreshAuthError struct {
+	status int
+}
+
+func (e *refreshAuthError) Error() string {
+	return fmt.Sprintf("cline refresh rejected: %d", e.status)
+}
+
+func isRefreshAuthFailure(err error) bool {
+	var authErr *refreshAuthError
+	return errors.As(err, &authErr)
+}
+
 func refreshClineToken(refreshToken string) (*clineRefreshResp, error) {
 	body := map[string]string{
 		"refreshToken": refreshToken,
@@ -221,7 +236,12 @@ func refreshClineToken(refreshToken string) (*clineRefreshResp, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("cline refresh failed: %d", resp.StatusCode)
+		switch resp.StatusCode {
+		case 400, 401, 403:
+			return nil, &refreshAuthError{status: resp.StatusCode}
+		default:
+			return nil, fmt.Errorf("cline refresh failed: %d", resp.StatusCode)
+		}
 	}
 
 	var c clineRefreshResp

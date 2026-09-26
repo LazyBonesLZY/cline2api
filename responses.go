@@ -305,6 +305,7 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, reqLo
 	}
 
 	reader := bufio.NewReader(upstream.Body)
+	var streamErr error
 	for {
 		line, err := reader.ReadString('\n')
 		if line != "" {
@@ -337,6 +338,9 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, reqLo
 			}
 		}
 		if err != nil {
+			if err != io.EOF {
+				streamErr = err
+			}
 			break
 		}
 	}
@@ -380,7 +384,11 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, reqLo
 		if acc != nil && latestUsage.Valid {
 			recordTokenUsage(acc, reqLog.Model, latestUsage)
 		}
-		finalizeRequestLog(reqLog, latestUsage, firstOutputAt, startedAt, true, "")
+		if streamErr != nil {
+			finalizeRequestLog(reqLog, latestUsage, firstOutputAt, startedAt, false, streamErr.Error())
+		} else {
+			finalizeRequestLog(reqLog, latestUsage, firstOutputAt, startedAt, true, "")
+		}
 	}
 }
 

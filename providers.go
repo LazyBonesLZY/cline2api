@@ -24,17 +24,17 @@ import (
 
 // CustomProvider 一个 OpenAI 兼容上游。
 type CustomProvider struct {
-	ID          string            `json:"id"`          // 稳定 ID（生成）
-	Name        string            `json:"name"`        // 显示名
-	BaseURL     string            `json:"baseURL"`     // 如 https://openrouter.ai/api/v1
-	APIKey      string            `json:"apiKey"`      // Bearer token
-	ModelIDs    []string          `json:"modelIds"`    // 该上游暴露的模型 ID（如 "z-ai/glm-5.3-flash"）
-	Headers     map[string]string `json:"headers,omitempty"` // 自定义请求头（如 OpenRouter 的 HTTP-Referer）
-	Enabled     bool              `json:"enabled"`
-	Priority    int               `json:"priority"`          // 越小越优先（同模型多上游时）
-	TimeoutSec  int               `json:"timeoutSec,omitempty"` // 默认 300
-	Free        bool              `json:"free"`              // 标记免费来源（供统计/兜底）
-	CreatedAt   time.Time         `json:"createdAt"`
+	ID         string            `json:"id"`                // 稳定 ID（生成）
+	Name       string            `json:"name"`              // 显示名
+	BaseURL    string            `json:"baseURL"`           // 如 https://openrouter.ai/api/v1
+	APIKey     string            `json:"apiKey"`            // Bearer token
+	ModelIDs   []string          `json:"modelIds"`          // 该上游暴露的模型 ID（如 "z-ai/glm-5.3-flash"）
+	Headers    map[string]string `json:"headers,omitempty"` // 自定义请求头（如 OpenRouter 的 HTTP-Referer）
+	Enabled    bool              `json:"enabled"`
+	Priority   int               `json:"priority"`             // 越小越优先（同模型多上游时）
+	TimeoutSec int               `json:"timeoutSec,omitempty"` // 默认 300
+	Free       bool              `json:"free"`                 // 标记免费来源（供统计/兜底）
+	CreatedAt  time.Time         `json:"createdAt"`
 }
 
 // providerRegistry 内存态 + 落盘（.cline-providers.json）。
@@ -191,8 +191,6 @@ func setProviderCooldown(providerID, model string, until time.Time) {
 	providersMu.Unlock()
 }
 
-
-
 // callProvider 调用自定义 provider 的 /chat/completions。
 func callProvider(p *CustomProvider, params map[string]any, stream bool) (*http.Response, error) {
 	body := map[string]any{}
@@ -249,11 +247,12 @@ func callProvider(p *CustomProvider, params map[string]any, stream bool) (*http.
 	if timeout <= 0 {
 		timeout = 5 * time.Minute
 	}
-	// 复用全局 transport（测试/代理定制经由 httpClient.Transport 生效）
-	client := &http.Client{Transport: httpClient.Transport, Timeout: timeout}
+	// 复用全局 transport（测试/代理定制经由 httpClient.Transport 生效）。
+	// 不设 Client.Timeout，流式 body 不受总超时切断；时限在 doHTTP 里按流/非流区分。
+	client := &http.Client{Transport: httpClient.Transport}
 
 	log.Printf("  provider upstream: name=%s model=%v stream=%v msgs=%d", p.Name, params["model"], stream, getMsgCount(params))
-	resp, err := client.Do(req)
+	resp, err := doHTTP(client, req, stream, timeout, upstreamHeaderTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("provider request: %w", err)
 	}
@@ -262,12 +261,14 @@ func callProvider(p *CustomProvider, params map[string]any, stream bool) (*http.
 	}
 	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
 	resp.Body.Close()
-	// 429 / 5xx：该 provider 模型冷却 5 分钟（有 Retry-After 时优先）
-	until := time.Now().Add(5 * time.Minute)
-	if ra := parseRetryAfter(resp.Header.Get("Retry-After")); ra > 0 {
-		until = time.Now().Add(ra)
+	// 只有 429 / 5xx 冷却。400/401 是配置或请求错误，冷却会让改完 Key 也要空等。
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+		until := time.Now().Add(5 * time.Minute)
+		if ra := parseRetryAfter(resp.Header.Get("Retry-After")); ra > 0 {
+			until = time.Now().Add(ra)
+		}
+		setProviderCooldown(p.ID, fmt.Sprintf("%v", params["model"]), until)
 	}
-	setProviderCooldown(p.ID, fmt.Sprintf("%v", params["model"]), until)
 	return nil, &clineAPIError{statusCode: resp.StatusCode, message: truncate(string(bodyBytes), 500)}
 }
 
@@ -285,12 +286,15 @@ func handleProviderStreamResponse(w http.ResponseWriter, upstream *http.Response
 	reader := bufio.NewReader(upstream.Body)
 	var latestUsage tokenUsage
 	var firstOutputAt time.Time
+	var streamErr error
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF && line != "" {
 				w.Write([]byte(line + "\n"))
 				flusher.Flush()
+			} else if err != io.EOF {
+				streamErr = err
 			}
 			break
 		}
@@ -322,7 +326,11 @@ func handleProviderStreamResponse(w http.ResponseWriter, upstream *http.Response
 		flusher.Flush()
 	}
 	recordTokenUsage(nil, reqLog.Model, latestUsage)
-	finalizeRequestLog(reqLog, latestUsage, firstOutputAt, reqLog.StartedAt, true, "")
+	if streamErr != nil {
+		finalizeRequestLog(reqLog, latestUsage, firstOutputAt, reqLog.StartedAt, false, streamErr.Error())
+	} else {
+		finalizeRequestLog(reqLog, latestUsage, firstOutputAt, reqLog.StartedAt, true, "")
+	}
 }
 
 // ============================================================================
@@ -362,9 +370,9 @@ var providerPresets = map[string]providerPreset{
 		FreeTier: true,
 	},
 	"gemini": {
-		Name:    "Google AI Studio",
-		BaseURL: "https://generativelanguage.googleapis.com/v1beta/openai",
-		Notes:   "Gemini free tier via OpenAI-compat layer. Key: aistudio.google.com/apikey",
+		Name:     "Google AI Studio",
+		BaseURL:  "https://generativelanguage.googleapis.com/v1beta/openai",
+		Notes:    "Gemini free tier via OpenAI-compat layer. Key: aistudio.google.com/apikey",
 		FreeTier: true,
 	},
 	"mistral": {
@@ -374,9 +382,9 @@ var providerPresets = map[string]providerPreset{
 		FreeTier: true,
 	},
 	"together": {
-		Name:    "Together AI",
-		BaseURL: "https://api.together.xyz/v1",
-		Notes:   "Some free models (e.g. Llama Vision free). Key: api.together.ai",
+		Name:     "Together AI",
+		BaseURL:  "https://api.together.xyz/v1",
+		Notes:    "Some free models (e.g. Llama Vision free). Key: api.together.ai",
 		FreeTier: true,
 	},
 	"deepseek": {
@@ -390,9 +398,9 @@ var providerPresets = map[string]providerPreset{
 		Notes:   "Paid. Key: platform.openai.com",
 	},
 	"vllm-local": {
-		Name:    "Local vLLM / Ollama",
-		BaseURL: "http://127.0.0.1:8000/v1",
-		Notes:   "Self-hosted OpenAI-compatible server (no key needed usually)",
+		Name:     "Local vLLM / Ollama",
+		BaseURL:  "http://127.0.0.1:8000/v1",
+		Notes:    "Self-hosted OpenAI-compatible server (no key needed usually)",
 		FreeTier: true,
 	},
 }

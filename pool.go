@@ -71,6 +71,12 @@ func loadPool() *AccountPool {
 
 	var p AccountPool
 	if err := json.Unmarshal(data, &p); err != nil {
+		// 坏文件不能当成空池继续写回去，否则一次写坏就会清掉全部账号。
+		backup := poolPath + ".corrupt"
+		log.Printf("accounts file corrupt (%v); moved aside to %s", err, backup)
+		if renErr := os.Rename(poolPath, backup); renErr != nil {
+			log.Printf("failed to preserve corrupt accounts file: %v", renErr)
+		}
 		pool = &AccountPool{Accounts: []*Account{}, Keys: []string{}, Models: []Model{}}
 		return pool
 	}
@@ -88,9 +94,29 @@ func loadPool() *AccountPool {
 	return pool
 }
 
+// savePool 在锁外调用：加锁后把当前池原子落盘。
 func savePool() {
-	data, _ := json.MarshalIndent(pool, "", "  ")
-	if err := os.WriteFile(poolPath, data, 0600); err != nil {
+	poolMu.Lock()
+	defer poolMu.Unlock()
+	savePoolLocked()
+}
+
+// savePoolLocked 要求调用方已持有 poolMu。先写临时文件再改名，避免写到一半留下坏 JSON。
+func savePoolLocked() {
+	if pool == nil {
+		return
+	}
+	data, err := json.MarshalIndent(pool, "", "  ")
+	if err != nil {
+		log.Printf("Failed to marshal accounts: %v", err)
+		return
+	}
+	tmp := poolPath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		log.Printf("Failed to save accounts: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, poolPath); err != nil {
 		log.Printf("Failed to save accounts: %v", err)
 	}
 }
@@ -99,8 +125,8 @@ func addAccount(acc *Account) {
 	p := loadPool()
 	poolMu.Lock()
 	p.Accounts = append(p.Accounts, acc)
+	savePoolLocked()
 	poolMu.Unlock()
-	savePool()
 }
 
 // findAccountByRefreshToken 按 refreshToken 查找已有账号（不存在返回 nil）。
@@ -146,7 +172,7 @@ func removeAccount(accountID string) bool {
 	for i, a := range p.Accounts {
 		if a.AccountID == accountID {
 			p.Accounts = append(p.Accounts[:i], p.Accounts[i+1:]...)
-			savePool()
+			savePoolLocked()
 			return true
 		}
 	}
@@ -166,11 +192,65 @@ func getAccountByID(accountID string) *Account {
 	return nil
 }
 
+// 同一账号的刷新合并成一次上游调用，避免并发轮换 refreshToken 时互相作废。
+type refreshFlight struct {
+	done chan struct{}
+	err  error
+}
+
+var (
+	refreshFlightMu sync.Mutex
+	refreshFlights  = map[string]*refreshFlight{}
+)
+
 func refreshAccountToken(acc *Account) error {
-	resp, err := refreshClineToken(acc.RefreshToken)
+	if acc == nil {
+		return fmt.Errorf("nil account")
+	}
+	id := acc.AccountID
+	if id == "" {
+		id = acc.RefreshToken
+	}
+
+	refreshFlightMu.Lock()
+	if flight, ok := refreshFlights[id]; ok {
+		refreshFlightMu.Unlock()
+		<-flight.done
+		return flight.err
+	}
+	flight := &refreshFlight{done: make(chan struct{})}
+	refreshFlights[id] = flight
+	refreshFlightMu.Unlock()
+
+	flight.err = refreshAccountTokenNow(acc)
+	close(flight.done)
+
+	refreshFlightMu.Lock()
+	delete(refreshFlights, id)
+	refreshFlightMu.Unlock()
+	return flight.err
+}
+
+func refreshAccountTokenNow(acc *Account) error {
+	poolMu.Lock()
+	refreshToken := acc.RefreshToken
+	poolMu.Unlock()
+
+	resp, err := refreshClineToken(refreshToken)
+	poolMu.Lock()
+	defer poolMu.Unlock()
 	if err != nil {
-		acc.Status = "expired"
-		savePool()
+		// 401/403 才是凭据失效。超时、断连、5xx 只短冷却，后台探活可以把它拉回来。
+		if isRefreshAuthFailure(err) {
+			acc.Status = "expired"
+		} else if acc.Status != "expired" {
+			acc.Status = "cooldown"
+			until := time.Now().Add(time.Minute)
+			if acc.CooldownUntil.Before(until) {
+				acc.CooldownUntil = until
+			}
+		}
+		savePoolLocked()
 		return fmt.Errorf("token refresh failed: %w", err)
 	}
 
@@ -180,7 +260,8 @@ func refreshAccountToken(acc *Account) error {
 	}
 	acc.ExpiresAt = parseExpiry(resp.Data.ExpiresAt) - 60000
 	acc.Status = "active"
-	savePool()
+	acc.CooldownUntil = time.Time{}
+	savePoolLocked()
 	return nil
 }
 
@@ -255,7 +336,7 @@ func pickAccountForModelWithFallback(model string, fallbackToActive bool) *Accou
 		acc = eligible[p.CurrentIdx]
 		p.CurrentIdx = (p.CurrentIdx + 1) % len(eligible)
 	}
-	savePool()
+	savePoolLocked()
 	return acc
 }
 
@@ -272,8 +353,8 @@ func pickAccountForModelLeastUsed(model string) *Account {
 	poolMu.Lock()
 	defer poolMu.Unlock()
 
-	var best *Account
 	var bestCount int64
+	var tied []*Account
 	for _, a := range p.Accounts {
 		if a.Status != "active" {
 			continue
@@ -286,18 +367,30 @@ func pickAccountForModelLeastUsed(model string) *Account {
 			}
 		}
 		var cnt int64
-		if st, ok := a.ModelStats[model]; ok {
+		if st, ok := a.ModelStats[model]; ok && st != nil {
 			cnt = st.UsageCount
 		}
-		if best == nil || cnt < bestCount {
-			best, bestCount = a, cnt
+		if tied == nil || cnt < bestCount {
+			bestCount = cnt
+			tied = []*Account{a}
+			continue
+		}
+		if cnt == bestCount {
+			tied = append(tied, a)
 		}
 	}
-	if best == nil {
+	if len(tied) == 0 {
 		return nil
 	}
-	savePool()
-	return best
+	// 用量相同（含付费模型从未记过 ModelStats、以及一批并发还没写回用量）时轮询，
+	// 避免回退流量总是打在账号列表的第一个上。
+	if p.CurrentIdx < 0 || p.CurrentIdx >= len(tied) {
+		p.CurrentIdx = 0
+	}
+	acc := tied[p.CurrentIdx]
+	p.CurrentIdx = (p.CurrentIdx + 1) % len(tied)
+	savePoolLocked()
+	return acc
 }
 
 // sortModelsByAvailability 将回退链按「可用性优先」重排：
@@ -356,7 +449,7 @@ func sortModelsByAvailability(chain []string) []string {
 	for i, c := range cs {
 		out[i] = c.model
 	}
-	savePool()
+	savePoolLocked()
 	return out
 }
 
@@ -386,20 +479,27 @@ func pickAccountLocked(p *AccountPool) *Account {
 		acc = active[p.CurrentIdx]
 		p.CurrentIdx = (p.CurrentIdx + 1) % len(active)
 	}
-	savePool()
+	savePoolLocked()
 	return acc
 }
 
 func ensureAccountToken(acc *Account) (string, error) {
-	if acc.AccessToken != "" && time.Now().UnixMilli() < acc.ExpiresAt {
-		return acc.AccessToken, nil
+	poolMu.Lock()
+	token := acc.AccessToken
+	exp := acc.ExpiresAt
+	poolMu.Unlock()
+	if token != "" && time.Now().UnixMilli() < exp {
+		return token, nil
 	}
 
 	if err := refreshAccountToken(acc); err != nil {
 		return "", err
 	}
 
-	return acc.AccessToken, nil
+	poolMu.Lock()
+	token = acc.AccessToken
+	poolMu.Unlock()
+	return token, nil
 }
 
 func listAccounts() []*Account {

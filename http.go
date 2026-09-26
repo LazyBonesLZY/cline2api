@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -27,9 +28,59 @@ var httpTransport = &http.Transport{
 
 var httpClient = &http.Client{
 	Transport: httpTransport,
-	// 上游整体兜底超时：流式响应的首字节通常远早于此，流本身不受此限制影响；
-	// 非流式请求（如探活）在极端排队时不会无限挂起。
-	Timeout: 5 * time.Minute,
+	// 不设 Client.Timeout：它会把读完整个 body 也算进去，长流式输出会被 5 分钟掐断。
+	// 时限按请求种类加在 context 上，见 doHTTP。
+}
+
+const (
+	upstreamHeaderTimeout = 60 * time.Second
+	upstreamTotalTimeout  = 5 * time.Minute
+	authRequestTimeout    = 60 * time.Second
+)
+
+// doHTTP 发出请求。stream 为真时只限制响应头等待，body 读到调用方关闭为止；
+// 非流式则用 total 覆盖响应头和 body。
+func doHTTP(client *http.Client, req *http.Request, stream bool, total, headerWait time.Duration) (*http.Response, error) {
+	if client == nil {
+		client = httpClient
+	}
+	if stream {
+		if headerWait <= 0 {
+			headerWait = upstreamHeaderTimeout
+		}
+		ctx, cancel := context.WithCancel(req.Context())
+		timer := time.AfterFunc(headerWait, cancel)
+		resp, err := client.Do(req.WithContext(ctx))
+		if !timer.Stop() {
+			cancel()
+			if resp != nil && resp.Body != nil {
+				resp.Body.Close()
+			}
+			if err == nil {
+				err = context.DeadlineExceeded
+			}
+			return nil, err
+		}
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		return withCancelOnClose(resp, cancel), nil
+	}
+	if total <= 0 {
+		total = upstreamTotalTimeout
+	}
+	ctx, cancel := context.WithTimeout(req.Context(), total)
+	resp, err := client.Do(req.WithContext(ctx))
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	return withCancelOnClose(resp, cancel), nil
+}
+
+func doUpstream(req *http.Request, stream bool) (*http.Response, error) {
+	return doHTTP(httpClient, req, stream, upstreamTotalTimeout, upstreamHeaderTimeout)
 }
 
 func httpPostForm(rawURL string, form url.Values) (*http.Response, error) {
@@ -38,7 +89,7 @@ func httpPostForm(rawURL string, form url.Values) (*http.Response, error) {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	return httpClient.Do(req)
+	return doHTTP(httpClient, req, false, authRequestTimeout, authRequestTimeout)
 }
 
 func httpPostJSON(rawURL string, body any) (*http.Response, error) {
@@ -51,7 +102,7 @@ func httpPostJSON(rawURL string, body any) (*http.Response, error) {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	return httpClient.Do(req)
+	return doHTTP(httpClient, req, false, authRequestTimeout, authRequestTimeout)
 }
 
 func readBody(resp *http.Response) string {
