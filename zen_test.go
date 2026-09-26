@@ -146,8 +146,10 @@ func TestRouteModelOffWhenOpenCodeDisabled(t *testing.T) {
 	if got := routeModel("cline-free/glm-5.2"); got != "cline" {
 		t.Fatalf("routeModel(cline id while opencode disabled) = %q, want cline", got)
 	}
+	p := loadPool()
+	p.Models = append(p.Models, Model{ID: "custom-oc", Provider: "opencode", Cost: "free", Status: "active"})
 	for _, m := range getAllModels() {
-		if isZenSource(m) {
+		if isZenSource(m) || m.Provider == "opencode" {
 			t.Fatalf("disabled opencode model still listed: %s", m.ID)
 		}
 	}

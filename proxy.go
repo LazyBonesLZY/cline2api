@@ -74,15 +74,10 @@ func getAllModels() []Model {
 	}
 
 	if !zenOn {
+		// 与管理页 isOcModel 一致：来源是 zen/seed，或 provider 写成 opencode，都不再展示。
 		zen = nil
-		kept := custom[:0]
-		for _, m := range custom {
-			if isZenSource(m) {
-				continue
-			}
-			kept = append(kept, m)
-		}
-		custom = kept
+		remote = omitOpencodeModels(remote)
+		custom = omitOpencodeModels(custom)
 	}
 
 	if len(remote) > 0 || len(zen) > 0 || remoteZenActive() {
@@ -108,6 +103,17 @@ func getAllModels() []Model {
 	result = append(result, builtin...)
 	result = append(result, custom...)
 	return result
+}
+
+func omitOpencodeModels(models []Model) []Model {
+	out := make([]Model, 0, len(models))
+	for _, m := range models {
+		if isZenSource(m) || m.Provider == "opencode" {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
 }
 
 // getDefaultModel 返回用户设置的默认模型；未设置时优先回退到第一个远程 free 模型，

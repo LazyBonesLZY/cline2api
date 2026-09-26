@@ -2510,6 +2510,7 @@ async function saveOcConfig() {
     _('ocSaveResult').innerHTML = '<span style="color:var(--green)">✓ ' + t('opencode 配置已保存') + '</span>';
     setTimeout(() => _('ocSaveResult').innerHTML = '', 5000);
     await loadOcConfig();
+    if (_('modelsList')) await loadModels();
   } catch (e) {
     toast(t('保存失败: ') + (e.message || ''), 'error');
   }
