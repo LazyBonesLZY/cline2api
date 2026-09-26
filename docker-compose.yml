@@ -6,9 +6,14 @@ services:
     ports:
       - "3457:3457"
     volumes:
-      # 宿主机路径必须是文件。不存在时 Docker 会建成目录，账号和配置就写不进去。
+      # 这些路径必须先是文件。不存在时 Docker 会建成目录，配置就写不进去。
       - ./.cline-accounts.json:/app/.cline-accounts.json
+      - ./.cline-config.json:/app/.cline-config.json
       - ./.cline-zen.json:/app/.cline-zen.json
+      - ./.cline-proxy.json:/app/.cline-proxy.json
+      - ./.cline-providers.json:/app/.cline-providers.json
+      - ./.cline-credentials.json:/app/.cline-credentials.json
+      - ./.cline-request-logs.json:/app/.cline-request-logs.json
       - ./override.md:/app/override.md:ro
     environment:
       - PORT=3457
