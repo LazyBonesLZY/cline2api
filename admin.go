@@ -1507,7 +1507,8 @@ func handleOpenCodeConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg := getZenConfig()
+	// 先在副本上校验，通过后再替换内存配置。中途失败不能把「已停用」只写在内存里、磁盘仍是启用。
+	cfg := *getZenConfig()
 	if req.Enabled != nil {
 		cfg.Enabled = *req.Enabled
 	}
@@ -1599,8 +1600,11 @@ func handleOpenCodeConfigUpdate(w http.ResponseWriter, r *http.Request) {
 		cfg.Compaction.MaxSummary = c.MaxSummary
 	}
 
-	setZenConfig(cfg)
-	log.Printf("admin: opencode config updated (enabled=%v)", cfg.Enabled)
+	if !cfg.Enabled {
+		cfg.Failover = false
+	}
+	setZenConfig(&cfg)
+	log.Printf("admin: opencode config updated (enabled=%v failover=%v)", cfg.Enabled, cfg.Failover)
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: tAPI(r, "opencode_config_saved")})
 }
 

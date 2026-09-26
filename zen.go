@@ -205,16 +205,45 @@ func isZenFreeModel(m Model) bool {
 	return false
 }
 
+// zenIdentified 判断这个模型名是不是 opencode 的模型（当前列表、种子 ID、别名或 opencode/ 前缀）。
+// 禁用后也要认出来，否则请求会掉进 Cline 路径，再从故障转移打回 opencode。
+func zenIdentified(id string) bool {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	if _, ok := resolveZenInfo(id); ok {
+		return true
+	}
+	bare := strings.TrimPrefix(id, "opencode/")
+	if bare != id {
+		if _, ok := resolveZenInfo(bare); ok {
+			return true
+		}
+	}
+	for _, sm := range zenSeedModels {
+		if sm.ID == id || sm.ID == bare {
+			return true
+		}
+		for _, alias := range sm.Aliases {
+			if alias == id || alias == bare {
+				return true
+			}
+		}
+	}
+	return strings.HasPrefix(id, "opencode/")
+}
+
 // routeModel 路由："zen" / "reject" / "off" / "cline"。
 // off：模型属于 opencode，但 opencode 已在管理页关闭。
 // 故障转移开启且 zen 连续失败期间，免费模型请求临时改走 cline 账号池。
 func routeModel(id string) string {
+	if !getZenConfig().Enabled && zenIdentified(id) {
+		return "off"
+	}
 	m, ok := resolveZenInfo(id)
 	if !ok {
 		return "cline"
-	}
-	if !getZenConfig().Enabled {
-		return "off"
 	}
 	if !isZenFreeModel(m) {
 		return "reject"
@@ -694,6 +723,10 @@ func buildZenBody(params map[string]any, stream bool, anonymous bool) map[string
 // 返回的响应由调用方关闭。
 func callZenAPI(params map[string]any, stream bool) (*http.Response, error) {
 	cfg := getZenConfig()
+	if !cfg.Enabled {
+		model, _ := params["model"].(string)
+		return nil, fmt.Errorf("opencode is disabled, refusing model %q", model)
+	}
 	anonymous := cfg.Key == "public"
 	bodyJSON, err := json.Marshal(buildZenBody(params, stream, anonymous))
 	if err != nil {
@@ -1050,6 +1083,10 @@ func describeZenProxy() string {
 // 自定义模型（Custom=true 或其他 Source）不受影响。
 func syncZenModels() modelSyncResult {
 	res := modelSyncResult{SyncedAt: time.Now().Format(time.RFC3339)}
+	if !getZenConfig().Enabled {
+		res.Error = "opencode is disabled"
+		return res
+	}
 	fail := func(err error) modelSyncResult {
 		msg := err.Error()
 		// 网络类错误给出代理配置提示（opencode.ai 被网络封锁时直连必然失败）

@@ -140,6 +140,9 @@ func TestRouteModelOffWhenOpenCodeDisabled(t *testing.T) {
 	if got := routeModel("deepseek-v4-flash-free"); got != "off" {
 		t.Fatalf("routeModel(disabled) = %q, want off", got)
 	}
+	if _, err := callZenAPI(map[string]any{"model": "deepseek-v4-flash-free"}, false); err == nil || !strings.Contains(err.Error(), "disabled") {
+		t.Fatalf("callZenAPI while disabled = %v, want disabled error", err)
+	}
 	if got := routeModel("cline-free/glm-5.2"); got != "cline" {
 		t.Fatalf("routeModel(cline id while opencode disabled) = %q, want cline", got)
 	}
