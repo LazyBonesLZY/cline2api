@@ -122,6 +122,56 @@ func TestRouteModelRejectPaid(t *testing.T) {
 	}
 }
 
+func TestRouteModelOffWhenOpenCodeDisabled(t *testing.T) {
+	withZenPool(t, append([]Model{}, builtinZenModels()...))
+	zenConfigMu.Lock()
+	old := zenConfig
+	disabled := defaultZenConfig()
+	disabled.Enabled = false
+	disabled.Failover = false
+	zenConfig = disabled
+	zenConfigMu.Unlock()
+	t.Cleanup(func() {
+		zenConfigMu.Lock()
+		zenConfig = old
+		zenConfigMu.Unlock()
+	})
+
+	if got := routeModel("deepseek-v4-flash-free"); got != "off" {
+		t.Fatalf("routeModel(disabled) = %q, want off", got)
+	}
+	if got := routeModel("cline-free/glm-5.2"); got != "cline" {
+		t.Fatalf("routeModel(cline id while opencode disabled) = %q, want cline", got)
+	}
+	for _, m := range getAllModels() {
+		if isZenSource(m) {
+			t.Fatalf("disabled opencode model still listed: %s", m.ID)
+		}
+	}
+	if _, attempted := clineFailoverToZen(map[string]any{"model": "free"}, false); attempted {
+		t.Fatal("disabled opencode should not receive cline failover")
+	}
+}
+
+func TestClineFailoverRespectsSwitch(t *testing.T) {
+	resetZenTestState(t)
+	zenConfigMu.Lock()
+	old := zenConfig
+	cfg := defaultZenConfig()
+	cfg.Enabled = true
+	cfg.Failover = false
+	zenConfig = cfg
+	zenConfigMu.Unlock()
+	t.Cleanup(func() {
+		zenConfigMu.Lock()
+		zenConfig = old
+		zenConfigMu.Unlock()
+	})
+	if _, attempted := clineFailoverToZen(map[string]any{"model": "z-ai/glm-5.3-flash"}, false); attempted {
+		t.Fatal("failover switch off should not call opencode")
+	}
+}
+
 func TestRouteModelClinePassthrough(t *testing.T) {
 	withZenPool(t, append([]Model{}, builtinZenModels()...))
 	if got := routeModel("cline-free/glm-5.2"); got != "cline" {
@@ -546,7 +596,7 @@ func TestAnthropicThinkingMapping(t *testing.T) {
 	cases := []struct {
 		name     string
 		thinking string
-		want     any    // expected reasoning_effort in translated request
+		want     any // expected reasoning_effort in translated request
 	}{
 		{"disabled→none", `{"type":"disabled"}`, "none"},
 		{"enabled→high", `{"type":"enabled","budget_tokens":8000}`, "high"},
@@ -578,7 +628,7 @@ func TestAnthropicThinkingMapping(t *testing.T) {
 
 func TestBuildUpstreamBodyNoneDropsReasoningEffort(t *testing.T) {
 	body := buildUpstreamBody(map[string]any{
-		"model":           "m1",
+		"model":            "m1",
 		"reasoning_effort": "none",
 	}, false)
 	if _, ok := body["reasoning_effort"]; ok {

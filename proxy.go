@@ -54,6 +54,7 @@ var builtinModels = []Model{
 //   - 已同步远程模型：Cline 远程（Source=remote）+ opencode 同步（Source=zen）+ 用户自定义
 //   - 未同步 / 离线：内置 fallback（Cline + zen 种子表）+ 用户自定义
 func getAllModels() []Model {
+	zenOn := getZenConfig().Enabled
 	p := loadPool()
 	poolMu.Lock()
 	defer poolMu.Unlock()
@@ -72,17 +73,36 @@ func getAllModels() []Model {
 		}
 	}
 
+	if !zenOn {
+		zen = nil
+		kept := custom[:0]
+		for _, m := range custom {
+			if isZenSource(m) {
+				continue
+			}
+			kept = append(kept, m)
+		}
+		custom = kept
+	}
+
 	if len(remote) > 0 || len(zen) > 0 || remoteZenActive() {
 		result := make([]Model, 0, len(remote)+len(zen)+len(custom))
 		result = append(result, remote...)
 		result = append(result, zen...)
 		result = append(result, custom...)
+		if len(remote) == 0 && len(result) == len(custom) {
+			// 只同步过 opencode、随后又关掉它：Cline 侧仍用内置列表，不要把可用模型清空。
+			base := append([]Model(nil), builtinModels...)
+			result = append(base, result...)
+		}
 		return result
 	}
 
 	builtin := make([]Model, 0, len(builtinModels)+len(zenSeedModels))
 	builtin = append(builtin, builtinModels...)
-	builtin = append(builtin, builtinZenModels()...)
+	if zenOn {
+		builtin = append(builtin, builtinZenModels()...)
+	}
 
 	result := make([]Model, 0, len(builtin)+len(custom))
 	result = append(result, builtin...)
@@ -402,6 +422,13 @@ func startProxy(host string, port int) error {
 
 		// 按 model 自动分流：zen 免费模型 / zen 付费拒绝 / 其余走 Cline 池
 		switch routeModel(model) {
+		case "off":
+			msg := fmt.Sprintf("model %q requires opencode, which is disabled", model)
+			finalizeRequestLog(&reqLog, tokenUsage{}, time.Time{}, reqLog.StartedAt, false, msg)
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": map[string]string{"message": msg, "type": "invalid_request_error"},
+			})
+			return
 		case "reject":
 			msg := fmt.Sprintf("model %q is a paid opencode model; only free models are proxied", model)
 			finalizeRequestLog(&reqLog, tokenUsage{}, time.Time{}, reqLog.StartedAt, false, msg)
@@ -772,6 +799,10 @@ func clineHeaders(token, sessionID string) http.Header {
 type clineAPIError struct {
 	statusCode int
 	message    string
+	// quota 为真表示这是该账号在该模型上的额度冷却（响应里有 Try again in）。
+	// 普通 429（网关、出口 IP、瞬时限流）不能当成账号额度，否则一次请求会把整池写上冷却，
+	// 而官方 Cline 客户端用同一批号仍然能请求。
+	quota bool
 }
 
 func (e *clineAPIError) Error() string {
@@ -807,6 +838,10 @@ func clineErrorHTTPStatus(err error) int {
 	if _, ok := err.(*freeModelUnavailableError); ok {
 		return http.StatusTooManyRequests
 	}
+	var apiErr *clineAPIError
+	if errors.As(err, &apiErr) && apiErr.statusCode == http.StatusTooManyRequests {
+		return http.StatusTooManyRequests
+	}
 	return http.StatusInternalServerError
 }
 
@@ -822,12 +857,14 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 		}
 		return resp, acc, err
 	}
-	// zen 免费模型进入 cline 池仅发生在 zen 故障转移期间：改写成 cline 侧可用的
-	// free 模型链，否则 Cline 上游会报 "invalid model format. Expected format:
-	// modelType/model"（zen 的裸模型 ID 不符合 Cline 的 provider/model 格式）。
-	if zm, ok := resolveZenInfo(model); ok && isZenFreeModel(zm) {
-		log.Printf("  zen failover: rewriting zen model %q to cline free chain", model)
-		return callFreeClineAPI(params, stream)
+	// zen 免费模型进入 cline 池仅发生在「opencode 开着、故障转移开着、且 zen 已判定不可达」时。
+	// 否则裸 zen 模型 ID 会被改写成 Cline free 链，等于故障转移关了也还在跑。
+	zenCfg := getZenConfig()
+	if zenCfg.Enabled && zenCfg.Failover && zenFailedNow() {
+		if zm, ok := resolveZenInfo(model); ok && isZenFreeModel(zm) {
+			log.Printf("  zen failover: rewriting zen model %q to cline free chain", model)
+			return callFreeClineAPI(params, stream)
+		}
 	}
 
 	// 显式模型请求降级序列：
@@ -886,6 +923,10 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 			if ok && isUpstreamClientError(apiErr.statusCode) {
 				return nil, usedAcc, err
 			}
+			if ok && apiErr.statusCode == http.StatusTooManyRequests && apiErr.quota {
+				// 该账号此模型额度用尽：冷却已记下，换下一个账号
+				continue
+			}
 			if !ok || apiErr.statusCode != http.StatusTooManyRequests {
 				// 5xx 等：若后面还有候选（provider / 链）则继续降级，否则透传
 				if !hasAnyFallbackLeft(model, m) {
@@ -893,7 +934,8 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 				}
 				break
 			}
-			// 429：模型冷却已记录，换下一个账号；全部冷却后降级到下一个模型
+			// 普通 429 不是这个号的额度。换号会把整池打上冷却，这里停在当前号，交给下一个模型。
+			break
 		}
 	}
 	// 终极兜底：free 链（手动链全部失败时自动切换）
@@ -1047,10 +1089,14 @@ func callFreeClineAPI(params map[string]any, stream bool) (*http.Response, *Acco
 			}
 			lastErr = err
 			lastWas429 = false
-			if apiErr, ok := err.(*clineAPIError); ok && apiErr.statusCode == http.StatusTooManyRequests {
-				// 429 限流：换下一个账号继续试当前模型
+			if apiErr, ok := err.(*clineAPIError); ok && apiErr.statusCode == http.StatusTooManyRequests && apiErr.quota {
+				// 该账号此模型额度用尽：换下一个账号继续试当前模型
 				lastWas429 = true
 				continue
+			}
+			if apiErr, ok := err.(*clineAPIError); ok && apiErr.statusCode == http.StatusTooManyRequests {
+				// 普通 429：不换号，避免把没被限流的账号也标成冷却
+				break
 			}
 			// 其他 API 错误（如上游 500）：换链内下一个模型降级
 			break
@@ -1130,15 +1176,15 @@ func callClineAPIWithAccount(acc *Account, params map[string]any, stream bool) (
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		bodyStr := string(bodyBytes)
-		// 429：模型级冷却 —— 只暂停该模型，账号保持可用，其他模型继续转发
+		// 429：只有响应写明该账号额度（Try again in）才做模型级冷却。
+		// 没有这段话的 429 不写号池，官方 Cline 客户端往往仍可直接请求。
 		if resp.StatusCode == 429 {
 			model, _ := body["model"].(string)
-			until := parseCooldownUntil(bodyStr)
-			if model != "" {
+			if until, ok := parseQuotaCooldown(bodyStr); ok && model != "" {
 				setModelCooldown(acc, model, until)
-			} else {
-				markAccountCooldown(acc, until)
+				return nil, acc, &clineAPIError{statusCode: resp.StatusCode, message: truncate(bodyStr, 500), quota: true}
 			}
+			return nil, acc, &clineAPIError{statusCode: resp.StatusCode, message: truncate(bodyStr, 500)}
 		}
 		return nil, acc, &clineAPIError{statusCode: resp.StatusCode, message: truncate(bodyStr, 500)}
 	}
@@ -1197,6 +1243,14 @@ var (
 	cooldownMinRe    = regexp.MustCompile(`(?i)(\d+)\s*m(?:in(?:ute)?s?)?`)
 	cooldownSecRe    = regexp.MustCompile(`(?i)(\d+)\s*s(?:ec(?:ond)?s?)?`)
 )
+
+// parseQuotaCooldown 只在响应明确给出该账号的恢复时间时返回 true。
+func parseQuotaCooldown(body string) (time.Time, bool) {
+	if !cooldownPhraseRe.MatchString(body) {
+		return time.Time{}, false
+	}
+	return parseCooldownUntil(body), true
+}
 
 func parseCooldownUntil(body string) time.Time {
 	phrase := body
@@ -2039,7 +2093,7 @@ func zenFailoverToCline(params map[string]any, stream bool) (*http.Response, *Ac
 // （连续失败被判定不可达）时不尝试；最多试 3 个免费模型，避免在坏模型上反复烧时间。
 func clineFailoverToZen(params map[string]any, stream bool) (*http.Response, bool) {
 	cfg := getZenConfig()
-	if !cfg.Enabled || zenFailedNow() {
+	if !cfg.Enabled || !cfg.Failover || zenFailedNow() {
 		return nil, false
 	}
 	orig, _ := params["model"].(string)
@@ -2099,6 +2153,13 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 
 	// 按 model 自动分流（与 chat 端点一致）：zen 免费/付费拒绝/Cline 池
 	switch routeModel(req.Model) {
+	case "off":
+		msg := fmt.Sprintf("model %q requires opencode, which is disabled", req.Model)
+		finalizeRequestLog(&reqLog, tokenUsage{}, time.Time{}, reqLog.StartedAt, false, msg)
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": map[string]string{"message": msg, "type": "invalid_request_error"},
+		})
+		return
 	case "reject":
 		msg := fmt.Sprintf("model %q is a paid opencode model; only free models are proxied", req.Model)
 		finalizeRequestLog(&reqLog, tokenUsage{}, time.Time{}, reqLog.StartedAt, false, msg)

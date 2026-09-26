@@ -205,12 +205,16 @@ func isZenFreeModel(m Model) bool {
 	return false
 }
 
-// routeModel 三态路由："zen" / "reject" / "cline"。
+// routeModel 路由："zen" / "reject" / "off" / "cline"。
+// off：模型属于 opencode，但 opencode 已在管理页关闭。
 // 故障转移开启且 zen 连续失败期间，免费模型请求临时改走 cline 账号池。
 func routeModel(id string) string {
 	m, ok := resolveZenInfo(id)
 	if !ok {
 		return "cline"
+	}
+	if !getZenConfig().Enabled {
+		return "off"
 	}
 	if !isZenFreeModel(m) {
 		return "reject"

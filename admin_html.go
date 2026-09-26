@@ -2469,7 +2469,7 @@ async function loadOcConfig() {
     const rt = c.runtime || {};
     let status;
     if (!c.enabled) status = '<span style="color:var(--text3)">⏸ ' + t('已停用') + '</span>';
-    else if (rt.failoverActive) status = '<span style="color:var(--red)">🔴 ' + t('故障转移中（opencode 暂不可用，请求走 Cline 池）') + '</span>';
+    else if (c.failover && rt.failoverActive) status = '<span style="color:var(--red)">🔴 ' + t('故障转移中（opencode 暂不可用，请求走 Cline 池）') + '</span>';
     else status = '<span style="color:var(--green)">🟢 ' + t('正常') + '</span>' +
       '<span style="margin-left:8px">' + t('已同步模型') + ': ' + (c.syncedModels || 0) + '</span>';
     _('ocRuntimeStatus').innerHTML = status;

@@ -498,6 +498,13 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	route := routeModel(chatModel)
 
 	switch route {
+	case "off":
+		msg := fmt.Sprintf("model %q requires opencode, which is disabled", chatModel)
+		finalizeRequestLog(&reqLog, tokenUsage{}, time.Time{}, reqLog.StartedAt, false, msg)
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": map[string]string{"message": msg, "type": "invalid_request_error"},
+		})
+		return
 	case "reject":
 		finalizeRequestLog(&reqLog, tokenUsage{}, time.Time{}, reqLog.StartedAt, false, "paid zen model rejected")
 		writeJSON(w, http.StatusBadRequest, map[string]any{

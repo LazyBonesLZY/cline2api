@@ -1117,6 +1117,51 @@ func TestOnlyFreeConfigRoundTrip(t *testing.T) {
 	}
 }
 
+func TestGeneric429DoesNotStampThePool(t *testing.T) {
+	oldPool := pool
+	oldConfig := getProxyConfig()
+	oldTransport := httpClient.Transport
+	t.Cleanup(func() {
+		pool = oldPool
+		setProxyConfig(oldConfig)
+		httpClient.Transport = oldTransport
+	})
+
+	first := &Account{
+		AccountID: "acc-a", Email: "a@example.com", AccessToken: "token-a",
+		ExpiresAt: time.Now().Add(time.Hour).UnixMilli(), Status: "active",
+	}
+	second := &Account{
+		AccountID: "acc-b", Email: "b@example.com", AccessToken: "token-b",
+		ExpiresAt: time.Now().Add(time.Hour).UnixMilli(), Status: "active",
+	}
+	pool = &AccountPool{Accounts: []*Account{first, second}}
+	setProxyConfig(defaultProxyConfig())
+	withoutZen(t)
+
+	var tokens []string
+	httpClient.Transport = freeModelRoundTripper(func(req *http.Request) (*http.Response, error) {
+		tokens = append(tokens, strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer "))
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Body:       io.NopCloser(strings.NewReader(`{"error":"rate_limit"}`)),
+			Header:     make(http.Header),
+			Request:    req,
+		}, nil
+	})
+
+	_, _, err := callClineAPI(map[string]any{"model": "free"}, false)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if len(tokens) != len(freeModelChain) {
+		t.Fatalf("upstream calls = %d, want %d (one try per model, not every account)", len(tokens), len(freeModelChain))
+	}
+	if len(first.ModelCooldowns) != 0 || len(second.ModelCooldowns) != 0 {
+		t.Fatalf("generic 429 stamped cooldowns: first=%v second=%v", first.ModelCooldowns, second.ModelCooldowns)
+	}
+}
+
 func TestParseCooldownUntilUnits(t *testing.T) {
 	cases := []struct {
 		body string
