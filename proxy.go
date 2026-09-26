@@ -105,6 +105,44 @@ func getAllModels() []Model {
 	return result
 }
 
+const clineFreePrefix = "cline-free/"
+
+// exposeModelID 在只启用 Cline 时，把对外模型名里的 cline-free/ 去掉。
+// 已有同名无前缀模型时保留前缀，避免两个条目挤成同一个 id。
+func exposeModelID(id string, catalog []Model) string {
+	if getZenConfig().Enabled || !strings.HasPrefix(id, clineFreePrefix) {
+		return id
+	}
+	bare := strings.TrimPrefix(id, clineFreePrefix)
+	for _, m := range catalog {
+		if m.ID == bare {
+			return id
+		}
+	}
+	return bare
+}
+
+// expandClineFreeAlias 把客户端发来的短名补回 cline-free/<name>，仅在 OpenCode 关闭且没有同名模型时。
+func expandClineFreeAlias(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" || getZenConfig().Enabled || strings.Contains(id, "/") {
+		return id
+	}
+	full := clineFreePrefix + id
+	hasExact, hasFull := false, false
+	for _, m := range getAllModels() {
+		if m.ID == id {
+			hasExact = true
+		} else if m.ID == full {
+			hasFull = true
+		}
+	}
+	if hasFull && !hasExact {
+		return full
+	}
+	return id
+}
+
 func omitOpencodeModels(models []Model) []Model {
 	out := make([]Model, 0, len(models))
 	for _, m := range models {
@@ -362,7 +400,7 @@ func startProxy(host string, port int) error {
 				ownedBy = "opencode"
 			}
 			list = append(list, map[string]any{
-				"id":       m.ID,
+				"id":       exposeModelID(m.ID, all),
 				"object":   "model",
 				"created":  time.Now().UnixMilli(),
 				"owned_by": ownedBy,
@@ -403,6 +441,11 @@ func startProxy(host string, port int) error {
 			}
 		}
 		model, _ := params["model"].(string)
+		if expanded := expandClineFreeAlias(model); expanded != model {
+			log.Printf("  model alias: %s -> %s", model, expanded)
+			model = expanded
+			params["model"] = expanded
+		}
 		log.Printf("  client: stream=%v tools=%d model=%s", isStream, toolCount, model)
 
 		reqLog := RequestLog{StartedAt: time.Now(), Protocol: "openai", Model: model, Stream: isStream}
@@ -2151,6 +2194,10 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		req.MaxTokens = defaultMaxTokens
 	}
 
+	if expanded := expandClineFreeAlias(req.Model); expanded != req.Model {
+		log.Printf("  model alias: %s -> %s", req.Model, expanded)
+		req.Model = expanded
+	}
 	openAIReq := anthropicToOpenAI(req)
 
 	log.Printf("  anthropic: model=%s stream=%v msgs=%d", req.Model, req.Stream, len(req.Messages))

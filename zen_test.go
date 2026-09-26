@@ -158,6 +158,38 @@ func TestRouteModelOffWhenOpenCodeDisabled(t *testing.T) {
 	}
 }
 
+func TestClineFreeAliasWhenOpenCodeDisabled(t *testing.T) {
+	withZenPool(t, []Model{
+		{ID: "cline-free/mimo-v2.6-flash", Provider: "cline-free", Cost: "free", Status: "active", Source: "remote"},
+		{ID: "deepseek/deepseek-v4-flash", Provider: "deepseek", Cost: "free", Status: "active", Source: "remote"},
+	})
+	zenConfigMu.Lock()
+	old := zenConfig
+	disabled := defaultZenConfig()
+	disabled.Enabled = false
+	zenConfig = disabled
+	zenConfigMu.Unlock()
+	t.Cleanup(func() {
+		zenConfigMu.Lock()
+		zenConfig = old
+		zenConfigMu.Unlock()
+	})
+
+	catalog := getAllModels()
+	if got := exposeModelID("cline-free/mimo-v2.6-flash", catalog); got != "mimo-v2.6-flash" {
+		t.Fatalf("exposed id = %q", got)
+	}
+	if got := exposeModelID("deepseek/deepseek-v4-flash", catalog); got != "deepseek/deepseek-v4-flash" {
+		t.Fatalf("non-free prefix changed: %q", got)
+	}
+	if got := expandClineFreeAlias("mimo-v2.6-flash"); got != "cline-free/mimo-v2.6-flash" {
+		t.Fatalf("alias expand = %q", got)
+	}
+	if got := expandClineFreeAlias("cline-free/mimo-v2.6-flash"); got != "cline-free/mimo-v2.6-flash" {
+		t.Fatalf("full id should stay: %q", got)
+	}
+}
+
 func TestClineFailoverRespectsSwitch(t *testing.T) {
 	resetZenTestState(t)
 	zenConfigMu.Lock()

@@ -495,6 +495,14 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		chat["messages"] = sanitizeMessages(msgs)
 	}
 	chatModel, _ := chat["model"].(string)
+	if expanded := expandClineFreeAlias(chatModel); expanded != chatModel {
+		log.Printf("  model alias: %s -> %s", chatModel, expanded)
+		chatModel = expanded
+		chat["model"] = expanded
+		if model == "" || model == strings.TrimPrefix(expanded, clineFreePrefix) {
+			reqLog.Model = expanded
+		}
+	}
 	route := routeModel(chatModel)
 
 	switch route {
