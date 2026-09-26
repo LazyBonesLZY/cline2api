@@ -33,7 +33,7 @@ func protocolTestServer(t *testing.T) string {
 
 	zenConfigMu.Lock()
 	oldZenConfig := zenConfig
-	zenConfig = &zenConfigData{BaseURL: zenAPIBase, Key: "public"}
+	zenConfig = &zenConfigData{BaseURL: zenAPIBase, Key: "public", Failover: true}
 	zenConfigMu.Unlock()
 
 	oldServerMux := serverMux

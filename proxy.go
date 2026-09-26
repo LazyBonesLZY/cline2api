@@ -987,8 +987,8 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 			break
 		}
 	}
-	// 终极兜底：free 链（手动链全部失败时自动切换）
-	if model != "free" && !isFreeAliasModel(model) {
+	// 终极兜底：故障转移开启时，配置链全部失败再走 free 链。
+	if getZenConfig().Failover && model != "free" && !isFreeAliasModel(model) {
 		fp := withModel(params, "free")
 		if resp, acc, err := callFreeClineAPI(fp, stream); err == nil {
 			log.Printf("  auto fallback: all configured options failed for %q, served by free chain", model)
@@ -1078,9 +1078,12 @@ func hasAnyFallbackLeft(requested, current string) bool {
 	return false
 }
 
-// modelFallbackChain 显式模型的降级序列：点名模型优先，其后是管理员配置的
-// 回退链（modelChain）；未配置时动态派生默认链（排除已下架模型）。均去重。
+// modelFallbackChain 显式模型的降级序列。故障转移关闭时只保留点名模型，
+// 失败直接返回，不再悄悄换成链上的另一个模型。
 func modelFallbackChain(requested string) []string {
+	if !getZenConfig().Failover {
+		return []string{requested}
+	}
 	configured := getProxyConfig().ModelChain
 	if len(configured) == 0 {
 		configured = defaultFreeChain()

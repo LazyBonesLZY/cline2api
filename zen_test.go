@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -187,6 +188,64 @@ func TestClineFreeAliasWhenOpenCodeDisabled(t *testing.T) {
 	}
 	if got := expandClineFreeAlias("cline-free/mimo-v2.6-flash"); got != "cline-free/mimo-v2.6-flash" {
 		t.Fatalf("full id should stay: %q", got)
+	}
+}
+
+func TestFailoverOffDoesNotSwitchModel(t *testing.T) {
+	oldPool := pool
+	oldConfig := getProxyConfig()
+	oldTransport := httpClient.Transport
+	zenConfigMu.Lock()
+	oldZen := zenConfig
+	cfg := defaultZenConfig()
+	cfg.Failover = false
+	zenConfig = cfg
+	zenConfigMu.Unlock()
+	t.Cleanup(func() {
+		pool = oldPool
+		setProxyConfig(oldConfig)
+		httpClient.Transport = oldTransport
+		zenConfigMu.Lock()
+		zenConfig = oldZen
+		zenConfigMu.Unlock()
+	})
+
+	account := &Account{
+		AccountID:   "direct-account",
+		Email:       "direct@example.com",
+		AccessToken: "direct-token",
+		ExpiresAt:   time.Now().Add(time.Hour).UnixMilli(),
+		Status:      "active",
+	}
+	pool = &AccountPool{Accounts: []*Account{account}}
+	setProxyConfig(defaultProxyConfig())
+
+	var attempted []string
+	httpClient.Transport = freeModelRoundTripper(func(req *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		var params map[string]any
+		if err := json.Unmarshal(body, &params); err != nil {
+			return nil, err
+		}
+		upstreamModel, _ := params["model"].(string)
+		attempted = append(attempted, upstreamModel)
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Body:       io.NopCloser(strings.NewReader(`{"error":"quota","message":"Try again in 1h"}`)),
+			Header:     make(http.Header),
+			Request:    req,
+		}, nil
+	})
+
+	_, _, err := callClineAPI(map[string]any{"model": "z-ai/glm-5.3-flash"}, false)
+	if err == nil {
+		t.Fatal("expected error when failover is off")
+	}
+	if len(attempted) != 1 || attempted[0] != "z-ai/glm-5.3-flash" {
+		t.Fatalf("upstream models = %v, want only the requested model", attempted)
 	}
 }
 

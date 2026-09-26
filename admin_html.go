@@ -734,8 +734,8 @@ textarea{resize:vertical;min-height:88px;font-family:ui-monospace,'SF Mono','Cas
         <div class="field"><label>重试次数</label><input type="number" id="ocRetries" min="0" max="10"></div>
         <div class="field"><label>故障转移</label>
           <select id="ocFailover">
-            <option value="true">开启（连续失败后暂走 Cline 池）</option>
-            <option value="false">关闭</option>
+            <option value="true">开启（失败后换模型 / 暂走另一上游）</option>
+            <option value="false">关闭（只打点名模型，失败就报错）</option>
           </select>
         </div>
         <div class="field"><label>失败阈值（次）</label><input type="number" id="ocFailoverCount" min="1" max="20"></div>
