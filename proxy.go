@@ -1185,20 +1185,25 @@ func hasAnyFallbackLeft(requested, current string) bool {
 
 // modelFallbackChain 显式模型的降级序列：点名模型优先，其后是管理员配置的
 // 回退链（modelChain）；未配置时动态派生默认链（排除已下架模型）。均去重。
-// 配置链会先经 filterStaleModels 剔除已下架条目；点名模型本身始终保留——
-// 它是客户端显式要求的（可能由 zen / provider 服务，不归本仓判定）。
+// 用户显式配置的链**不做列表过滤**：官方列表之外常有实测仍可用的模型
+// （列表只是参考不是白名单），失效条目由请求时的模型级冷却与故障转移兜底；
+// 只有动态派生的免费链才按 liveModelSet 过滤下架条目。点名模型本身始终
+// 保留 —— 它是客户端显式要求的（可能由 zen / provider 服务，不归本仓判定）。
 func modelFallbackChain(requested string) []string {
 	configured := getProxyConfig().ModelChain
-	if len(configured) == 0 {
+	userConfigured := len(configured) > 0
+	if !userConfigured {
 		configured = defaultFreeChain()
+		configured = filterStaleModels(configured)
 	}
-	configured = filterStaleModels(configured)
-	chain := make([]string, 0, 1+len(configured))
-	chain = append(chain, requested)
+	seen := map[string]bool{requested: true}
+	chain := []string{requested}
 	for _, m := range configured {
-		if m != requested {
-			chain = append(chain, m)
+		if m == "" || seen[m] {
+			continue
 		}
+		seen[m] = true
+		chain = append(chain, m)
 	}
 	return chain
 }

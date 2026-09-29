@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -144,5 +145,33 @@ func TestSyncClineModelsMarksDelisted(t *testing.T) {
 	}
 	if len(res2.Removed) != 0 {
 		t.Errorf("res2.Removed = %v, want empty (model revived)", res2.Removed)
+	}
+}
+
+// 用户显式配置的回退链不做列表过滤：列表外但实测仍可用的模型允许配置；
+// 动态派生的免费链仍按 liveModelSet 过滤下架条目。
+func TestModelFallbackChainKeepsUserConfiguredOutOfList(t *testing.T) {
+	oldPool, oldPath := pool, poolPath
+	oldCfg := getProxyConfig()
+	t.Cleanup(func() {
+		pool, poolPath = oldPool, oldPath
+		setProxyConfig(oldCfg)
+	})
+	poolPath = filepath.Join(t.TempDir(), ".cline-accounts.json")
+	pool = &AccountPool{Accounts: []*Account{}, Keys: []string{}, Models: []Model{
+		{ID: "cline-free/gemini-3.8-flash", Source: "remote", Cost: "free", Status: "active"},
+	}}
+	setProxyConfig(&proxyConfigData{ModelChain: []string{"out-of-list/still-works", "cline-free/gemini-3.8-flash", "out-of-list/still-works"}})
+
+	chain := modelFallbackChain("requested-model")
+	got := strings.Join(chain, ",")
+	if !strings.Contains(got, "out-of-list/still-works") {
+		t.Errorf("user-configured out-of-list model must be kept in the chain, got: %s", got)
+	}
+	if strings.Count(got, "out-of-list/still-works") != 1 {
+		t.Errorf("chain should be deduped, got: %s", got)
+	}
+	if chain[0] != "requested-model" {
+		t.Errorf("requested model must stay first, got: %s", got)
 	}
 }

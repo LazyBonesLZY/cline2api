@@ -1042,6 +1042,8 @@ func handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
+	var chainUnverified []string // 回退链中不在可用列表的条目（保存后回显提示）
+
 	var req struct {
 		Strategy     string            `json:"strategy"`
 		Headers      map[string]string `json:"headers"`
@@ -1078,12 +1080,15 @@ func handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.ModelChain != nil {
-		// 校验回退链：允许 "free" 别名或存在的模型 ID；去空去重
+		// 回退链：去空去重，允许不在可用列表里的模型 ID —— 官方列表之外
+		// 仍有实测可用的模型（同步列表只是参考，不是白名单）；失效条目由
+		// 请求时的模型级冷却与故障转移兜底。不在列表的条目回显给前端提示。
 		known := map[string]bool{"free": true}
 		for _, m := range getAllModels() {
 			known[m.ID] = true
 		}
 		var chain []string
+		var unverified []string
 		seen := map[string]bool{}
 		for _, raw := range *req.ModelChain {
 			id := strings.TrimSpace(raw)
@@ -1091,14 +1096,17 @@ func handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if !known[id] {
-				writeAPI(w, http.StatusBadRequest, apiResponse{Error: fmt.Sprintf("unknown model in modelChain: %s", id)})
-				return
+				unverified = append(unverified, id)
 			}
 			seen[id] = true
 			chain = append(chain, id)
 		}
 		cfg.ModelChain = chain
+		if len(unverified) > 0 {
+			log.Printf("  model chain: kept out-of-list model(s) %v (not in synced list, may still work)", unverified)
+		}
 		changed = true
+		chainUnverified = unverified
 	}
 
 	if req.OnlyFree != nil {
@@ -1163,13 +1171,14 @@ func handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
-		"strategy":      cfg.Strategy,
-		"headers":       cfg.Headers,
-		"onlyFree":      cfg.OnlyFree,
-		"defaultModel":  getDefaultModel(),
-		"host":          listenHost,
-		"address":       fmt.Sprintf("%s:%d", effectiveAdminHost(listenHost), listenPort),
-		"restarting":    restarting,
+		"strategy":         cfg.Strategy,
+		"headers":          cfg.Headers,
+		"onlyFree":         cfg.OnlyFree,
+		"defaultModel":     getDefaultModel(),
+		"host":             listenHost,
+		"address":          fmt.Sprintf("%s:%d", effectiveAdminHost(listenHost), listenPort),
+		"restarting":       restarting,
+		"chainUnverified":  chainUnverified,
 	}})
 }
 
