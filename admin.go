@@ -76,6 +76,7 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/batch-import", auth(handleBatchImport))
 	mux.HandleFunc("/admin/api/accounts/refresh-all", auth(handleAdminRefreshAll))
 	mux.HandleFunc("/admin/api/accounts/delete-all", auth(handleAdminDeleteAll))
+	mux.HandleFunc("/admin/api/accounts/dedup", auth(handleAdminAccountDedup))
 	mux.HandleFunc("/admin/api/accounts/reset", auth(handleAdminAccountReset))
 	mux.HandleFunc("/admin/api/accounts/test", auth(handleAdminAccountTest))
 	mux.HandleFunc("/admin/api/keys", auth(handleAdminGetKeys))
@@ -314,8 +315,13 @@ func handleAdminAccountAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 去重：该 refreshToken 已存在时直接返回，不重复添加
-	if existing := findAccountByRefreshToken(req.RefreshToken); existing != nil {
+	// 去重：refreshToken 或邮箱任一已存在即视为重复账号，不重复添加。
+	// 邮箱级去重针对 token 轮换后重新导入的场景（token 变了、账号没变）。
+	existing := findAccountByRefreshToken(req.RefreshToken)
+	if existing == nil && strings.TrimSpace(req.Email) != "" {
+		existing = findAccountByEmail(req.Email)
+	}
+	if existing != nil {
 		writeAPI(w, http.StatusOK, apiResponse{
 			Success: true,
 			Message: tAPI(r, "account_exists", existing.Email),
@@ -653,15 +659,16 @@ func handleBatchImport(w http.ResponseWriter, r *http.Request) {
 	imported := 0
 	duplicates := 0
 	errors := []string{}
-	seen := make(map[string]bool)
+	// 同时按 refreshToken 与邮箱去重：同一 Cline 账号 token 轮换后重新导入时，
+	// token 变了但邮箱不变，只按 token 去重会留下重复记录。
+	dedup := newImportDedup()
 
 	for _, t := range req.Tokens {
 		token := strings.TrimSpace(t.RefreshToken)
 		if token == "" {
 			continue
 		}
-		// 去重：与账号池中已有账号或本批次内重复的 token，跳过而不是重复添加
-		if isDuplicateImportToken(token, seen) {
+		if dedup.duplicate(token, t.Email) {
 			duplicates++
 			continue
 		}
@@ -1460,6 +1467,30 @@ func handleAdminAccountModels(w http.ResponseWriter, r *http.Request) {
 		Success: true,
 		Message: tAPI(r, "account_models_saved"),
 		Data:    map[string]any{"accountId": acc.AccountID, "models": models},
+	})
+}
+
+// POST /admin/api/accounts/dedup
+// 清理账号池中同邮箱的重复记录：每个邮箱保留一条（状态可用优先、用量高优先），
+// 其余删除并把统计累加进保留的那条。返回删除条数与去重后总数。
+func handleAdminAccountDedup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: tAPI(r, "method_not_allowed")})
+		return
+	}
+	before := len(loadPool().Accounts)
+	removed, remaining := dedupeAccountsByEmail()
+	if removed > 0 {
+		log.Printf("admin: deduped accounts by email, removed=%d remaining=%d", removed, remaining)
+	}
+	writeAPI(w, http.StatusOK, apiResponse{
+		Success: true,
+		Message: tAPI(r, "accounts_deduped", removed),
+		Data: map[string]any{
+			"before":    before,
+			"removed":   removed,
+			"remaining": remaining,
+		},
 	})
 }
 

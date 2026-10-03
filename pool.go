@@ -169,6 +169,183 @@ func isDuplicateImportToken(refreshToken string, seen map[string]bool) bool {
 	return false
 }
 
+// normalizeEmail 归一化邮箱用于比对：去空白 + 转小写。
+// 同一邮箱大小写不同（Outlook 常见）必须视为同一账号，否则会重复入池。
+func normalizeEmail(email string) string {
+	return strings.ToLower(strings.TrimSpace(email))
+}
+
+// findAccountByEmail 按邮箱查找已有账号（不存在或邮箱为空返回 nil）。
+func findAccountByEmail(email string) *Account {
+	email = normalizeEmail(email)
+	if email == "" {
+		return nil
+	}
+	p := loadPool()
+	poolMu.Lock()
+	defer poolMu.Unlock()
+
+	for _, a := range p.Accounts {
+		if normalizeEmail(a.Email) == email {
+			return a
+		}
+	}
+	return nil
+}
+
+// importDedup 维护一次导入批次内的去重状态。
+// refreshToken 与邮箱各一份：同一账号可能以不同 token 重复出现（token 轮换后重新导入），
+// 仅按 token 去重会漏掉这类重复。
+type importDedup struct {
+	seenTokens map[string]bool
+	seenEmails map[string]bool
+}
+
+func newImportDedup() *importDedup {
+	return &importDedup{seenTokens: map[string]bool{}, seenEmails: map[string]bool{}}
+}
+
+// duplicate 判断该条导入是否应跳过：refreshToken 或邮箱任一命中（池中已有 / 本批次已见）即重复。
+// 命中后会同时记入两个 seen 集合。
+func (d *importDedup) duplicate(refreshToken, email string) bool {
+	refreshToken = strings.TrimSpace(refreshToken)
+	if refreshToken == "" {
+		return true
+	}
+	email = normalizeEmail(email)
+
+	if d.seenTokens[refreshToken] || accountExists(refreshToken) {
+		return true
+	}
+	// 邮箱为空时无法做邮箱级去重，退化为仅按 token 去重
+	if email != "" && (d.seenEmails[email] || findAccountByEmail(email) != nil) {
+		return true
+	}
+
+	d.seenTokens[refreshToken] = true
+	if email != "" {
+		d.seenEmails[email] = true
+	}
+	return false
+}
+
+// accountScore 为去重时的「保留优先级」打分：状态可用优先，其次用量高的优先。
+// 目的：合并重复记录时保留真正在用的那条，而不是随机留下一条。
+func accountScore(a *Account) int64 {
+	var s int64
+	switch a.Status {
+	case "active":
+		s = 2
+	case "cooldown":
+		s = 1
+	}
+	return s*1_000_000_000 + a.UsageCount
+}
+
+// dedupeAccountsByEmail 清理账号池中同邮箱的重复记录。
+// 每个邮箱只保留一条（状态可用优先、用量高优先），其余删除；
+// 被删记录的用量与 token 统计累加进保留的那条，避免历史统计凭空消失。
+// 返回 (删除条数, 去重后账号总数)。
+func dedupeAccountsByEmail() (removed int, remaining int) {
+	p := loadPool()
+	poolMu.Lock()
+	defer poolMu.Unlock()
+
+	// 邮箱为空 / 仅空白的记录不参与去重（无法判定是否同一账号）
+	best := make(map[string]*Account, len(p.Accounts))
+	kept := make([]*Account, 0, len(p.Accounts))
+
+	for _, a := range p.Accounts {
+		email := normalizeEmail(a.Email)
+		if email == "" {
+			kept = append(kept, a)
+			continue
+		}
+		prev, ok := best[email]
+		if !ok {
+			best[email] = a
+			kept = append(kept, a)
+			continue
+		}
+		// 重复记录：把统计并入分高的那条，然后丢弃当前这条
+		keep, drop := prev, a
+		if accountScore(a) > accountScore(prev) {
+			keep, drop = a, prev
+			// 替换 kept 中的旧条目，保持顺序稳定
+			for i, k := range kept {
+				if k == prev {
+					kept[i] = a
+					break
+				}
+			}
+			best[email] = a
+		}
+		mergeAccountStats(keep, drop)
+		removed++
+	}
+
+	if removed == 0 {
+		return 0, len(p.Accounts)
+	}
+	p.Accounts = kept
+	savePoolLocked()
+	return removed, len(p.Accounts)
+}
+
+// mergeAccountStats 把 drop 的累计用量并入 keep（同账号的重复记录，统计应累加）。
+func mergeAccountStats(keep, drop *Account) {
+	keep.UsageCount += drop.UsageCount
+	keep.PromptTokens += drop.PromptTokens
+	keep.CompletionTokens += drop.CompletionTokens
+	keep.TotalTokens += drop.TotalTokens
+	keep.CachedTokens += drop.CachedTokens
+
+	if drop.LastUsed.After(keep.LastUsed) {
+		keep.LastUsed = drop.LastUsed
+	}
+	if len(drop.ModelStats) > 0 {
+		if keep.ModelStats == nil {
+			keep.ModelStats = make(map[string]*ModelStat)
+		}
+		for mid, st := range drop.ModelStats {
+			if st == nil {
+				continue
+			}
+			cur := keep.ModelStats[mid]
+			if cur == nil {
+				cp := *st
+				keep.ModelStats[mid] = &cp
+				continue
+			}
+			cur.UsageCount += st.UsageCount
+			cur.PromptTokens += st.PromptTokens
+			cur.CompletionTokens += st.CompletionTokens
+			cur.TotalTokens += st.TotalTokens
+			cur.CachedTokens += st.CachedTokens
+		}
+	}
+	if len(drop.ModelCooldowns) > 0 {
+		if keep.ModelCooldowns == nil {
+			keep.ModelCooldowns = make(map[string]time.Time)
+		}
+		for mid, until := range drop.ModelCooldowns {
+			if cur, ok := keep.ModelCooldowns[mid]; !ok || until.After(cur) {
+				keep.ModelCooldowns[mid] = until
+			}
+		}
+	}
+	// 专供模型取并集：任一条指定过的模型都保留，避免去重后路由行为变化
+	if len(drop.AssignedModels) > 0 {
+		merged := append([]string(nil), keep.AssignedModels...)
+		for _, m := range drop.AssignedModels {
+			if !containsModel(merged, m) {
+				merged = append(merged, m)
+			}
+		}
+		keep.AssignedModels = merged
+	}
+}
+
 func removeAccount(accountID string) bool {
 	p := loadPool()
 	poolMu.Lock()

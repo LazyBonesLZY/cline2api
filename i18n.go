@@ -121,6 +121,10 @@ var apiMessages = map[string]map[locale]string{
 		localeZH: "全部账号已删除",
 		localeEN: "All accounts deleted",
 	},
+	"accounts_deduped": {
+		localeZH: "已去重：删除 %d 条重复账号",
+		localeEN: "Deduped: removed %d duplicate accounts",
+	},
 	"reset_failed": {
 		localeZH: "重置失败：%s",
 		localeEN: "reset failed: %s",

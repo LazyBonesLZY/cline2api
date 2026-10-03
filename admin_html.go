@@ -458,6 +458,7 @@ textarea{resize:vertical;min-height:88px;font-family:ui-monospace,'SF Mono','Cas
       <button class="btn btn-sm btn-danger" onclick="deleteSelectedAccounts(this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>删除选中<span id="delCount"></span></button>
       <button class="btn btn-sm" onclick="exportAccounts()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>导出全部</button>
       <button class="btn btn-primary btn-sm" onclick="switchTab('import')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>添加</button>
+      <button class="btn btn-sm" onclick="dedupeAccounts(this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M21 3l-7 7"/><path d="M8 21H3v-5"/><path d="M3 21l7-7"/></svg>去重</button>
       <button class="btn btn-sm" onclick="loadAccounts()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>刷新</button>
     </div>
   </div>
@@ -1420,6 +1421,14 @@ const I18N = {
   '已保存: ': 'Saved: ',
   ' 个模型': ' models',
   '账号不存在': 'Account not found',
+  // 账号去重
+  '去重': 'Dedupe',
+  '去重中...': 'Deduping...',
+  '已去重：删除 ': 'Deduped: removed ',
+  ' 条重复，剩余 ': ' duplicates, ',
+  ' 个账号': ' accounts left',
+  '没有发现重复账号': 'No duplicate accounts found',
+  '去重失败: ': 'Dedupe failed: ',
 };
 let LANG = 'zh';
 const LC = () => LANG === 'en' ? 'en-US' : 'zh-CN';
@@ -2109,6 +2118,25 @@ async function deleteAllAccounts() {
     toast(t('全部账号已删除'), 'success');
     loadAccounts(); loadStats();
   } catch (e) { toast(t('删除失败: ') + e.message, 'error'); }
+}
+
+// 去重：清理同邮箱的重复账号（token 轮换后重新导入会产生这类重复）。
+// 每个邮箱保留一条（状态可用优先、用量高优先），统计累加进保留的那条。
+async function dedupeAccounts(btn) {
+  const orig = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="loading"></span> ' + t('去重中...'); }
+  try {
+    const d = await api('POST', '/accounts/dedup', {});
+    const r = d.data || {};
+    if (r.removed > 0) {
+      toast(t('已去重：删除 ') + r.removed + t(' 条重复，剩余 ') + r.remaining + t(' 个账号'), 'success');
+    } else {
+      toast(t('没有发现重复账号'), 'info');
+    }
+    await loadAccounts();
+    await loadStats();
+  } catch (e) { toast(t('去重失败: ') + e.message, 'error'); }
+  if (btn) { btn.disabled = false; btn.innerHTML = orig; }
 }
 
 async function refreshAllTokens() {
