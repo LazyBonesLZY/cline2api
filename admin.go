@@ -91,6 +91,7 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/models/add", auth(handleAdminModelAdd))
 	mux.HandleFunc("/admin/api/models/delete", auth(handleAdminModelDelete))
 	mux.HandleFunc("/admin/api/models/context", auth(handleAdminModelContext))
+	mux.HandleFunc("/admin/api/accounts/models", auth(handleAdminAccountModels))
 	mux.HandleFunc("/admin/api/config", auth(handleAdminConfig))
 	mux.HandleFunc("/admin/api/config/update", auth(handleAdminUpdateConfig))
 	mux.HandleFunc("/admin/api/providers", auth(handleProvidersList))
@@ -1368,6 +1369,75 @@ func handleAdminModelContext(w http.ResponseWriter, r *http.Request) {
 	savePool()
 	log.Printf("  model context updated: %s ctx=%d out=%d", req.ID, req.Context, req.Output)
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: tAPI(r, "model_context_saved")})
+}
+
+// POST /admin/api/accounts/models  body: { accountId, models: ["model-a", ...] }
+// 设置账号的「专供模型」列表。空数组 = 解除指定，恢复参与所有模型的轮询。
+// 语义：模型一旦被某账号指定，就只由这些账号服务（付费模型的正确归属）；
+// 被指定过的账号也不再接手其它模型，避免付费额度被免费流量打光。
+func handleAdminAccountModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: tAPI(r, "method_not_allowed")})
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: err.Error()})
+		return
+	}
+	defer r.Body.Close()
+
+	var req struct {
+		AccountID string   `json:"accountId"`
+		Models    []string `json:"models"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: tAPI(r, "invalid_json")})
+		return
+	}
+	if req.AccountID == "" {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: tAPI(r, "account_id_required")})
+		return
+	}
+
+	acc := getAccountByID(req.AccountID)
+	if acc == nil {
+		writeAPI(w, http.StatusNotFound, apiResponse{Error: tAPI(r, "account_not_found")})
+		return
+	}
+
+	// 校验模型 ID 存在于可用模型列表，避免写出永远不会被命中的死配置
+	if len(req.Models) > 0 {
+		known := make(map[string]bool, len(builtinModels))
+		for _, m := range getAllModels() {
+			known[m.ID] = true
+		}
+		known["free"] = true
+		for _, m := range req.Models {
+			if id := strings.TrimSpace(m); id != "" && !known[id] {
+				writeAPI(w, http.StatusBadRequest, apiResponse{Error: tAPI(r, "invalid_model_id", id)})
+				return
+			}
+		}
+	}
+
+	models := normalizeAssignedModels(req.Models)
+
+	poolMu.Lock()
+	acc.AssignedModels = models
+	// 清掉这些模型的「未订阅」冷却：用户刚指定过，理应立刻可以再试
+	for _, m := range models {
+		delete(acc.ModelCooldowns, m)
+	}
+	poolMu.Unlock()
+	savePool()
+
+	log.Printf("admin: account %s assigned models=%v", acc.Email, models)
+	writeAPI(w, http.StatusOK, apiResponse{
+		Success: true,
+		Message: tAPI(r, "account_models_saved"),
+		Data:    map[string]any{"accountId": acc.AccountID, "models": models},
+	})
 }
 
 // GET /admin/api/stats

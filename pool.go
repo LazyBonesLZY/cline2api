@@ -297,8 +297,15 @@ func pickAccountForModelWithFallback(model string, fallbackToActive bool) *Accou
 	poolMu.Lock()
 	defer poolMu.Unlock()
 
-	active := make([]*Account, 0)
-	for _, a := range p.Accounts {
+	// 候选集先按「模型指定」收敛：付费模型只由指定账号服务，
+	// 被指定过的账号也不再接手其它模型（详见 modelCandidatesLocked）。
+	candidates := modelCandidatesLocked(p, model)
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	active := make([]*Account, 0, len(candidates))
+	for _, a := range candidates {
 		if a.Status == "active" {
 			active = append(active, a)
 		}
@@ -321,34 +328,108 @@ func pickAccountForModelWithFallback(model string, fallbackToActive bool) *Accou
 
 	if len(eligible) == 0 {
 		if fallbackToActive {
-			return pickAccountLocked(p)
+			// 只回退到候选集内的账号：回退到没有订阅的账号只会换来一个 403
+			return pickFromAccountsLocked(p, active)
 		}
 		return nil
 	}
 
-	cfg := getProxyConfig()
-	var acc *Account
-	switch cfg.Strategy {
-	case "fill":
-		acc = eligible[0]
-	case "random":
-		n := time.Now().UnixNano() % int64(len(eligible))
-		acc = eligible[n]
-	default: // round_robin
-		if p.CurrentIdx >= len(eligible) {
-			p.CurrentIdx = 0
-		}
-		acc = eligible[p.CurrentIdx]
-		p.CurrentIdx = (p.CurrentIdx + 1) % len(eligible)
-	}
+	acc := pickFromAccountsLocked(p, eligible)
 	savePoolLocked()
 	return acc
 }
 
-// pickAccountForModelLeastUsed 在所有「模型未冷却」的 active 账号中，选择该模型
+// pickFromAccountsLocked 在已持有 poolMu 的前提下，按配置策略从给定账号列表里选一个。
+func pickFromAccountsLocked(p *AccountPool, list []*Account) *Account {
+	if len(list) == 0 {
+		return nil
+	}
+	cfg := getProxyConfig()
+	switch cfg.Strategy {
+	case "fill":
+		return list[0]
+	case "random":
+		return list[time.Now().UnixNano()%int64(len(list))]
+	default: // round_robin
+		if p.CurrentIdx >= len(list) {
+			p.CurrentIdx = 0
+		}
+		acc := list[p.CurrentIdx]
+		p.CurrentIdx = (p.CurrentIdx + 1) % len(list)
+		return acc
+	}
+}
+
+// normalizeAssignedModels 清洗模型指定列表：去空去重，保持用户输入顺序。
+func normalizeAssignedModels(models []string) []string {
+	if len(models) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(models))
+	seen := make(map[string]bool, len(models))
+	for _, m := range models {
+		m = strings.TrimSpace(m)
+		if m == "" || seen[m] {
+			continue
+		}
+		seen[m] = true
+		out = append(out, m)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func containsModel(list []string, model string) bool {
+	for _, m := range list {
+		if m == model {
+			return true
+		}
+	}
+	return false
+}
+
+// modelOwnersLocked 返回所有把该模型列为专属的账号（不论状态），
+// 用于稳定判定「这个模型是否已被指定」。
+func modelOwnersLocked(p *AccountPool, model string) []*Account {
+	var owners []*Account
+	for _, a := range p.Accounts {
+		if containsModel(a.AssignedModels, model) {
+			owners = append(owners, a)
+		}
+	}
+	return owners
+}
+
+// modelCandidatesLocked 返回可以服务该模型的账号候选集（调用方再按状态/冷却过滤）：
+//  1. 有账号把该模型列为专属（AssignedModels 含该模型）→ 只有这些账号服务它；
+//     这是付费模型的正确语义：没有订阅的账号请求它只会拿到 403 ENTITLEMENT；
+//  2. 该模型无人认领 → 只有「未指定任何模型」的账号参与，被指定过的账号
+//     只服务它自己的列表，避免付费额度被免费流量打光。
+//
+// 无任何指定配置时，候选集等于全部账号，行为与旧版本完全一致。
+func modelCandidatesLocked(p *AccountPool, model string) []*Account {
+	if model == "" {
+		return p.Accounts
+	}
+	if owners := modelOwnersLocked(p, model); len(owners) > 0 {
+		return owners
+	}
+	out := make([]*Account, 0, len(p.Accounts))
+	for _, a := range p.Accounts {
+		if len(a.AssignedModels) == 0 {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// pickAccountForModelLeastUsed 在所有「模型未冷却」的候选账号中，选择该模型
 // 历史用量最少的账号（并清掉已过期的冷却记录）。等量时按轮询索引取，保持原有
 // 公平性；全部不可用返回 nil。供回退链上的非首选模型使用：流量应摊到较少
 // 使用的账号上，而不是每次都砸在第一个可用账号。
+// 候选集与 pickAccountForModel 一致：模型指定的优先/独占规则同样生效。
 func pickAccountForModelLeastUsed(model string) *Account {
 	if model == "" {
 		return pickAccount()
@@ -360,7 +441,7 @@ func pickAccountForModelLeastUsed(model string) *Account {
 
 	var bestCount int64
 	var tied []*Account
-	for _, a := range p.Accounts {
+	for _, a := range modelCandidatesLocked(p, model) {
 		if a.Status != "active" {
 			continue
 		}
@@ -419,7 +500,7 @@ func sortModelsByAvailability(chain []string) []string {
 	for i, m := range chain {
 		avail := false
 		minUsage := int64(-1)
-		for _, a := range p.Accounts {
+		for _, a := range modelCandidatesLocked(p, m) {
 			if a.Status != "active" {
 				continue
 			}
@@ -542,6 +623,10 @@ func listAccounts() []*Account {
 			for mid, until := range a.ModelCooldowns {
 				cp.ModelCooldowns[mid] = until
 			}
+		}
+		// 模型指定（脱敏拷贝，供后台展示与编辑）
+		if len(a.AssignedModels) > 0 {
+			cp.AssignedModels = append([]string(nil), a.AssignedModels...)
 		}
 		result[i] = cp
 	}

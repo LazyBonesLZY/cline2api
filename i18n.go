@@ -165,6 +165,14 @@ var apiMessages = map[string]map[locale]string{
 		localeZH: "模型不存在",
 		localeEN: "model not found",
 	},
+	"invalid_model_id": {
+		localeZH: "无效的模型 ID：%s（不在可用模型列表中）",
+		localeEN: "invalid model ID: %s (not in the available models list)",
+	},
+	"account_models_saved": {
+		localeZH: "账号的专供模型已保存",
+		localeEN: "Account model assignment saved",
+	},
 	"model_deleted": {
 		localeZH: "模型已删除",
 		localeEN: "model deleted",

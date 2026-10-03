@@ -21,6 +21,12 @@ type Account struct {
 	ModelStats map[string]*ModelStat `json:"modelStats,omitempty"`
 	// ModelCooldowns 模型级冷却：modelID → 恢复时间（429 时记录，只暂停该模型）
 	ModelCooldowns map[string]time.Time `json:"modelCooldowns,omitempty"`
+	// AssignedModels 该账号「专供」的模型列表（管理后台指定）。
+	// 空 = 不限制，参与所有模型的轮询（默认行为，向后兼容）；
+	// 非空 = 只有列表内的模型才会选中这个账号。
+	// 用途：付费（cline-pass）账号只服务它订阅的付费模型，避免免费模型
+	// 把付费额度打光；也避免付费模型请求落在没有订阅的免费账号上（403 ENTITLEMENT）。
+	AssignedModels []string `json:"assignedModels,omitempty"`
 }
 
 type Model struct {

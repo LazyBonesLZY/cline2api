@@ -852,6 +852,9 @@ type clineAPIError struct {
 	// 普通 429（网关、出口 IP、瞬时限流）不能当成账号额度，否则一次请求会把整池写上冷却，
 	// 而官方 Cline 客户端用同一批号仍然能请求。
 	quota bool
+	// entitlement 为真表示该账号未订阅此模型（403 ENTITLEMENT_ERROR）。
+	// 处理方式与 quota 一致：换下一个账号/模型，而不是把 403 当成请求错误透传。
+	entitlement bool
 }
 
 func (e *clineAPIError) Error() string {
@@ -878,12 +881,47 @@ func (e *freeModelUnavailableError) Error() string {
 	return e.message
 }
 
+// modelEntitlementError 表示「没有任何可用账号订阅了该模型」。
+// 这是客户端可理解的 4xx（403），而不是服务端故障，不能以 500 返回。
+type modelEntitlementError struct {
+	model   string
+	message string
+}
+
+func (e *modelEntitlementError) Error() string {
+	if e.message != "" {
+		return e.message
+	}
+	return fmt.Sprintf("no account in the pool is subscribed to model %q; assign a paid account to it in the admin panel (/admin/ → Accounts)", e.model)
+}
+
 // isUpstreamClientError 判断是否为不应触发模型回退的客户端错误。429 除外，它走冷却换号。
 func isUpstreamClientError(status int) bool {
 	return status >= 400 && status < 500 && status != http.StatusTooManyRequests
 }
 
+// entitlementDenialTTL 是「账号无权访问该模型」的默认拉黑时长。
+// 订阅状态在账号有效期内不会自行变化，长 TTL 可避免每次请求都先去撞一次 403；
+// 在管理后台重新指定模型或重置账号即可清除。
+const entitlementDenialTTL = 24 * time.Hour
+
+var entitlementRe = regexp.MustCompile(`(?i)ENTITLEMENT_ERROR|not subscribed to required model plan`)
+
+// isEntitlementError 判断是否「该账号没有订阅这个模型」。
+// Cline 付费模型对未订阅账号返回 403 + ENTITLEMENT_ERROR；这不是参数错误，
+// 换一个账号（或换模型）才是正确处置，绝不能直接 500 透传给客户端。
+func isEntitlementError(status int, body string) bool {
+	if status != http.StatusForbidden && status != http.StatusUnauthorized {
+		return false
+	}
+	return body != "" && entitlementRe.MatchString(body)
+}
+
 func clineErrorHTTPStatus(err error) int {
+	var entitlementErr *modelEntitlementError
+	if errors.As(err, &entitlementErr) {
+		return http.StatusForbidden
+	}
 	if _, ok := err.(*freeModelUnavailableError); ok {
 		return http.StatusTooManyRequests
 	}
@@ -931,6 +969,9 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 			chain = append(chain, m)
 		}
 	}
+	// entitlementExhausted 记录「该模型的候选账号全部因未订阅而被拒」：
+	// 这种请求的正确答案是 403 + 处置建议，而不是 500/429。
+	entitlementExhausted := make(map[string]bool)
 	for _, m := range chain {
 		// 先试自定义 provider
 		if pResp, pErr, attempted := callCustomProviderAPI(withModel(params, m), stream); attempted {
@@ -950,11 +991,13 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 		if m != model {
 			pickAcc = pickAccountForModelLeastUsed
 		}
+		attempted, denied := 0, 0
 		for {
 			acc := pickAcc(m)
 			if acc == nil {
 				break // 该模型所有账号均冷却/不可用 → 尝试链上下一个模型
 			}
+			attempted++
 			resp, usedAcc, err := callClineAPIWithAccount(acc, withModel(params, m), stream)
 			if err == nil {
 				if m != model {
@@ -968,6 +1011,13 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 				continue
 			}
 			apiErr, ok := err.(*clineAPIError)
+			// 该账号未订阅此模型（403 ENTITLEMENT）：冷却已记下，换下一个候选账号。
+			// 必须早于下面的 isUpstreamClientError 判定——403 是 4xx，但它是账号问题，
+			// 当成请求错误透传正是这个 bug 的成因。
+			if ok && apiErr.entitlement {
+				denied++
+				continue
+			}
 			// 4xx（除 429）是请求本身的问题，换模型只会把参数错误伪装成另一个模型的成功。
 			if ok && isUpstreamClientError(apiErr.statusCode) {
 				return nil, usedAcc, err
@@ -986,6 +1036,10 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 			// 普通 429 不是这个号的额度。换号会把整池打上冷却，这里停在当前号，交给下一个模型。
 			break
 		}
+		// 试遍了候选账号且全部被拒 → 该模型在本池中无人订阅
+		if attempted > 0 && denied == attempted {
+			entitlementExhausted[m] = true
+		}
 	}
 	// 终极兜底：故障转移开启时，配置链全部失败再走 free 链。
 	if getZenConfig().Failover && model != "free" && !isFreeAliasModel(model) {
@@ -1001,6 +1055,11 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 	// Cline 侧（含 free 链）全部耗尽 → 反向故障转移到 zen 免费模型
 	if fbResp, attempted := clineFailoverToZen(params, stream); attempted {
 		return fbResp, nil, nil
+	}
+	// 点名模型（含链上所有候选）都被「未订阅」拒掉：明确告诉客户端是权限问题，
+	// 并指出处置方式，而不是伪装成 500 或限流。
+	if entitlementExhausted[model] {
+		return nil, nil, &modelEntitlementError{model: model}
 	}
 	if hasActiveAccounts() {
 		return nil, nil, &freeModelUnavailableError{message: fmt.Sprintf("model %q is cooling on all accounts and no fallback model is available", model)}
@@ -1122,6 +1181,7 @@ func callFreeClineAPI(params map[string]any, stream bool) (*http.Response, *Acco
 	chain = sortModelsByAvailability(chain)
 	var lastErr error
 	lastWas429 := false
+	lastWasEntitlement := false
 	for _, model := range chain {
 		params["model"] = model
 		// "free" 链是纯降级路径：全部用「最久未用优先」挑账号，摊平用量。
@@ -1141,6 +1201,12 @@ func callFreeClineAPI(params map[string]any, stream bool) (*http.Response, *Acco
 			}
 			lastErr = err
 			lastWas429 = false
+			lastWasEntitlement = false
+			if apiErr, ok := err.(*clineAPIError); ok && apiErr.entitlement {
+				// 该账号未订阅此模型：冷却已记下，换下一个候选账号继续试
+				lastWasEntitlement = true
+				continue
+			}
 			if apiErr, ok := err.(*clineAPIError); ok && apiErr.statusCode == http.StatusTooManyRequests && apiErr.quota {
 				// 该账号此模型额度用尽：换下一个账号继续试当前模型
 				lastWas429 = true
@@ -1155,8 +1221,9 @@ func callFreeClineAPI(params map[string]any, stream bool) (*http.Response, *Acco
 		}
 	}
 	if lastErr != nil {
-		if lastWas429 {
-			// 整条链被限流耗尽：按 free 池不可用处理（429）
+		if lastWas429 || lastWasEntitlement {
+			// 整条链被限流/无权限耗尽：按 free 池不可用处理（429），
+			// 与「账号耗尽」同义，由上层决定是否再降级。
 			return nil, nil, &freeModelUnavailableError{message: "no eligible accounts available for free models"}
 		}
 		return nil, nil, lastErr
@@ -1228,6 +1295,17 @@ func callClineAPIWithAccount(acc *Account, params map[string]any, stream bool) (
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		bodyStr := string(bodyBytes)
+		// 403 ENTITLEMENT：该账号未订阅此模型。这是「账号选错了」，不是请求错误，
+		// 必须让上层换账号/换模型，否则会以 500 透传给客户端。
+		if isEntitlementError(resp.StatusCode, bodyStr) {
+			model, _ := body["model"].(string)
+			if model != "" {
+				setModelCooldown(acc, model, time.Now().Add(entitlementDenialTTL))
+				log.Printf("  entitlement denied: account=%s model=%s (cooldown %v)",
+					truncateEmail(acc.Email), model, entitlementDenialTTL)
+			}
+			return nil, acc, &clineAPIError{statusCode: resp.StatusCode, message: truncate(bodyStr, 500), entitlement: true}
+		}
 		// 429：只有响应写明该账号额度（Try again in）才做模型级冷却。
 		// 没有这段话的 429 不写号池，官方 Cline 客户端往往仍可直接请求。
 		if resp.StatusCode == 429 {
