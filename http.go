@@ -24,12 +24,21 @@ var httpTransport = &http.Transport{
 	MaxIdleConnsPerHost: 10,
 	IdleConnTimeout:     90 * time.Second,
 	DisableCompression:  false,
+	// 拨号由 clineDialContext 负责（出口代理池 + 内置 net.Dialer 超时），
+	// 不要在这里再设 DialContext：Go 结构体字面量不允许重复字段。
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+	// 响应头限时：非流式请求在生成完成前不返回响应头，等价于旧的兜底超时；
+	// 流式响应的响应头几乎立即到达，不限制流的后续读取时长。
+	ResponseHeaderTimeout: 5 * time.Minute,
 }
 
 var httpClient = &http.Client{
 	Transport: httpTransport,
-	// 不设 Client.Timeout：它会把读完整个 body 也算进去，长流式输出会被 5 分钟掐断。
-	// 时限按请求种类加在 context 上，见 doHTTP。
+	// 注意：绝不能设置 Client.Timeout —— Go 的 Client.Timeout 包含整个响应体读取时间，
+	// 会把超过 5 分钟的流式响应拦腰截断（表现为「流式中途断掉」）。
+	// 超时改为 transport 级（拨号/TLS/响应头限时，body 读取不限时），
+	// 并按请求种类在 context 上再加一层：流式只限响应头等待，见 doHTTP。
 }
 
 const (

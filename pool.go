@@ -245,8 +245,8 @@ func refreshAccountTokenNow(acc *Account) error {
 	poolMu.Lock()
 	defer poolMu.Unlock()
 	if err != nil {
-		// 401/403 才是凭据失效。超时、断连、5xx 只短冷却，后台探活可以把它拉回来。
-		if isRefreshAuthFailure(err) {
+		// 400/401/403 才是凭据失效。超时、断连、5xx 只短冷却，后台探活可以把它拉回来。
+		if isRefreshRejected(err) {
 			acc.Status = "expired"
 		} else if acc.Status != "expired" {
 			acc.Status = "cooldown"
