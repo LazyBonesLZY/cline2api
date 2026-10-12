@@ -318,12 +318,15 @@ func refreshAccountToken(acc *Account) error {
 				return nil
 			}
 			acc.Status = "expired"
-		} else {
-			acc.Status = "cooldown"
-			acc.CooldownUntil = time.Now().Add(5 * time.Minute)
+			savePool()
+			// 双通道都拒绝 = WorkOS 会话已被服务端终结（invalid_grant: Session
+			// has already ended / token revoked），刷新救不回，必须重新授权
+			return fmt.Errorf("refresh token rejected by both Cline and WorkOS (session ended or revoked) — account requires re-authorization: 管理页「导入账号」→ OAuth 登录")
 		}
+		acc.Status = "cooldown"
+		acc.CooldownUntil = time.Now().Add(5 * time.Minute)
 		savePool()
-		return fmt.Errorf("token refresh failed: %w", err)
+		return fmt.Errorf("token refresh failed (transient): %w", err)
 	}
 
 	acc.AccessToken = "workos:" + resp.Data.AccessToken

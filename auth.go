@@ -273,11 +273,15 @@ func refreshViaWorkOS(refreshToken string) *authenticateResp {
 	}
 	resp, err := httpPostJSON(workosAuthenticateURL, body)
 	if err != nil {
+		log.Printf("  WorkOS refresh fallback failed: %v", err)
 		return nil
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
+		// 失败原因要可见：invalid_grant（Session has already ended / token revoked）
+		// = 会话已被服务端终结，只能重新授权；其余为瞬时/格式问题
+		log.Printf("  WorkOS refresh fallback rejected: %d %s", resp.StatusCode, truncate(readBody(resp), 200))
 		return nil
 	}
 	var a authenticateResp
