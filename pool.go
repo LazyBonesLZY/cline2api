@@ -170,6 +170,12 @@ func refreshAccountToken(acc *Account) error {
 	resp, err := refreshClineToken(acc.RefreshToken)
 	if err != nil {
 		if isRefreshRejected(err) {
+			// cline 自家 refresh 端点拒绝 ≠ 账号真失效：refresh token 本质是
+			// WorkOS token，走 WorkOS authenticate 端点仍可能自愈，不必重新授权。
+			if wos := refreshViaWorkOS(acc.RefreshToken); wos != nil {
+				applyWorkOSTokens(acc, wos)
+				return nil
+			}
 			acc.Status = "expired"
 		} else {
 			acc.Status = "cooldown"
@@ -187,6 +193,28 @@ func refreshAccountToken(acc *Account) error {
 	acc.Status = "active"
 	savePool()
 	return nil
+}
+
+// applyWorkOSTokens 用 WorkOS 直接刷新到的令牌续命账号：优先回 cline
+// /auth/register 换正式 cline 令牌；注册也失败时直接用 workos 前缀令牌
+// （Cline 上游接受），轮换出的新 refresh token 一并落盘。
+func applyWorkOSTokens(acc *Account, wos *authenticateResp) {
+	if cline, err := registerWithCline(wos.AccessToken, wos.RefreshToken); err == nil && cline.Data.AccessToken != "" {
+		acc.AccessToken = "workos:" + cline.Data.AccessToken
+		if cline.Data.RefreshToken != "" {
+			acc.RefreshToken = cline.Data.RefreshToken
+		}
+		acc.ExpiresAt = parseExpiry(cline.Data.ExpiresAt) - 60000
+	} else {
+		acc.AccessToken = "workos:" + wos.AccessToken
+		if wos.RefreshToken != "" {
+			acc.RefreshToken = wos.RefreshToken
+		}
+		acc.ExpiresAt = time.Now().Add(time.Hour).UnixMilli() - 60000
+	}
+	acc.Status = "active"
+	savePool()
+	log.Printf("  account %s: token refreshed via WorkOS fallback (no re-auth needed)", acc.Email)
 }
 
 func pickAccount() *Account {

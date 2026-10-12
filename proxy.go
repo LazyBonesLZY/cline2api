@@ -1089,9 +1089,17 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 	if model == "free" {
 		resp, acc, err := callFreeClineAPI(params, stream)
 		if err != nil {
-			// Cline 残血池整条链耗尽（429 冷却/无账号）→ 落到 zen 免费模型
-			if fbResp, attempted := clineFailoverToZen(params, stream); attempted {
+			// Cline 残血池整条链耗尽（429 冷却/无账号）→ 落到 zen 免费模型。
+			// 转移前记下链尾实际模型：没有任何 zen 模型服务成功时还原，
+			// 否则请求日志会把失败请求记成最后一个 zen 尝试的模型
+			// （链尾 cline 模型才是实际归宿）。
+			lastChainModel, _ := params["model"].(string)
+			fbResp, _ := clineFailoverToZen(params, stream)
+			if fbResp != nil {
 				return fbResp, nil, nil
+			}
+			if lastChainModel != "" {
+				params["model"] = lastChainModel
 			}
 		}
 		return resp, acc, err
@@ -1181,9 +1189,15 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 			return resp, acc, nil
 		}
 	}
-	// Cline 侧（含 free 链）全部耗尽 → 反向故障转移到 zen 免费模型
-	if fbResp, attempted := clineFailoverToZen(params, stream); attempted {
+	// Cline 侧（含 free 链）全部耗尽 → 反向故障转移到 zen 免费模型。
+	// 没有任何 zen 模型服务成功时还原模型名：请求日志按 params 记实际服务
+	// 模型，不能记成最后一次失败的 zen 尝试
+	fbResp, _ := clineFailoverToZen(params, stream)
+	if fbResp != nil {
 		return fbResp, nil, nil
+	}
+	if model != "" {
+		params["model"] = model
 	}
 	if hasActiveAccounts() {
 		return nil, nil, &freeModelUnavailableError{message: fmt.Sprintf("model %q is cooling on all accounts and no fallback model is available", model)}
