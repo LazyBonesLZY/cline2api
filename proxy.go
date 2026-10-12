@@ -1643,9 +1643,12 @@ func testAccount(acc *Account) accountTestResult {
 	result := accountTestResult{AccountID: acc.AccountID, Email: acc.Email}
 	started := time.Now()
 
+	// max_tokens 不能太小：推理模型（effort=high）会把预算全耗在 reasoning 上，
+	// 16 token 时上游必回「empty response content」500，账号测试与冷却恢复
+	// 频繁误报（issue #32）。1024 对连通性探针足够且成本可忽略。
 	params := map[string]any{
 		"model":      getDefaultModel(),
-		"max_tokens": 16,
+		"max_tokens": 1024,
 		"stream":     false,
 		"messages": []any{
 			map[string]any{"role": "user", "content": "hi"},

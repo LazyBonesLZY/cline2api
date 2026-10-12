@@ -506,6 +506,7 @@ textarea{resize:vertical;min-height:88px;font-family:ui-monospace,'SF Mono','Cas
     <div style="display:flex;gap:8px">
       <button class="btn btn-sm" onclick="testAllAccounts(this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>测试全部</button>
       <button class="btn btn-sm" onclick="exportSelectedAccounts()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>导出选中<span id="selCount"></span></button>
+      <button class="btn btn-sm" onclick="resetSelectedAccounts(this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>重置选中<span id="resetCount"></span></button>
       <button class="btn btn-sm btn-danger" onclick="deleteSelectedAccounts(this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>删除选中<span id="delCount"></span></button>
       <button class="btn btn-sm" onclick="exportAccounts()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>导出全部</button>
       <button class="btn btn-primary btn-sm" onclick="switchTab('import')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>添加</button>
@@ -514,9 +515,13 @@ textarea{resize:vertical;min-height:88px;font-family:ui-monospace,'SF Mono','Cas
   </div>
   <div class="section">
     <div class="section-body flush">
+      <div style="display:flex;gap:8px;align-items:center;padding:10px 16px;border-bottom:1px solid var(--border2)">
+        <input type="text" id="accSearch" placeholder="搜索邮箱..." oninput="onAccSearch(this.value)" style="flex:1;max-width:320px;padding:7px 12px;border-radius:8px;border:1px solid var(--border2);background:var(--surface2);color:var(--text);font-size:13px">
+        <span id="accSearchCount" style="font-size:12px;color:var(--text3)"></span>
+      </div>
       <table class="account-table">
         <thead>
-          <tr><th style="width:30px;text-align:center"><input type="checkbox" id="accSelAll" onchange="toggleAllAccountSel(this)" title="全选本页"></th><th style="width:40px">#</th><th>邮箱</th><th>状态</th><th>请求</th><th>输入</th><th>输出</th><th>总 Token</th><th>缓存</th><th>最后使用</th><th>创建时间</th><th>操作</th></tr>
+          <tr><th style="width:30px;text-align:center"><input type="checkbox" id="accSelAll" onchange="toggleAllAccountSel(this)" title="全选本页"></th><th style="width:40px">#</th><th onclick="onAccSort('email')" style="cursor:pointer" title="点击排序">邮箱</th><th onclick="onAccSort('status')" style="cursor:pointer" title="点击排序">状态</th><th onclick="onAccSort('usage')" style="cursor:pointer" title="点击排序">请求</th><th>输入</th><th>输出</th><th onclick="onAccSort('total')" style="cursor:pointer" title="点击排序">总 Token</th><th onclick="onAccSort('cached')" style="cursor:pointer" title="点击排序">缓存</th><th onclick="onAccSort('lastUsed')" style="cursor:pointer" title="点击排序">最后使用</th><th onclick="onAccSort('createdAt')" style="cursor:pointer" title="点击排序">创建时间</th><th>操作</th></tr>
         </thead>
         <tbody id="accountTableBody">
           <tr><td colspan="12" class="empty">加载中...</td></tr>
@@ -1320,6 +1325,13 @@ const I18N = {
   '个账号 · 每页': ' accounts · per page ',
   '全选本页': 'Select all on this page',
   '已下架': 'Delisted',
+  '匹配': 'Match ',
+  '没有匹配的账号': 'No matching accounts',
+  '请先勾选要重置的账号': 'Select accounts to reset first',
+  '确认重置选中的 ': 'Confirm resetting ',
+  ' 个账号？（清除冷却与失败计数）': ' selected accounts? (clears cooldowns and failure counts)',
+  '重置中...': 'Resetting...',
+  '已重置 ': 'Reset ',
   '免费模型': 'Free models',
   '付费模型': 'Paid models',
   '（免费）': ' (free)',
@@ -1813,35 +1825,85 @@ let _accPage = 1;
 const _accPageSize = 20;
 const _checkedAccounts = new Set();
 let _lastAccountList = []; // loadAccounts 缓存：全选本页/分页器复用，避免重复请求
+let _accSearch = ''; // 邮箱搜索词（不区分大小写）
+let _accSort = { key: null, dir: 1 }; // 列排序：key 见 _accSortValue，dir 1/-1
+
+function _accSortValue(a, key) {
+  switch (key) {
+    case 'email': return (a.email || '').toLowerCase();
+    case 'status': return a.status || '';
+    case 'usage': return a.usageCount || 0;
+    case 'total': return a.totalTokens || 0;
+    case 'cached': return a.cachedTokens || 0;
+    case 'lastUsed': return a.lastUsed ? new Date(a.lastUsed).getTime() : 0;
+    case 'createdAt': return a.createdAt ? new Date(a.createdAt).getTime() : 0;
+  }
+  return null;
+}
+
+// 点击表头排序：同列切换升/降，新列默认升序
+function onAccSort(key) {
+  if (_accSort.key === key) _accSort.dir = -_accSort.dir;
+  else _accSort = { key: key, dir: 1 };
+  _accPage = 1;
+  loadAccounts();
+}
+
+// 按搜索词过滤 + 列排序后的完整列表（分页/全选/计数都基于它）
+function filteredAccountList() {
+  let list = _lastAccountList;
+  if (_accSearch) {
+    const q = _accSearch.toLowerCase();
+    list = list.filter(a => (a.email || '').toLowerCase().includes(q));
+  }
+  if (_accSort.key) {
+    const key = _accSort.key, dir = _accSort.dir;
+    list = list.slice().sort((a, b) => {
+      const va = _accSortValue(a, key), vb = _accSortValue(b, key);
+      if (va == null || vb == null) return 0;
+      return (va < vb ? -1 : va > vb ? 1 : 0) * dir;
+    });
+  }
+  return list;
+}
+
+function onAccSearch(v) {
+  _accSearch = v.trim();
+  _accPage = 1;
+  loadAccounts();
+}
 
 async function loadAccounts() {
   try {
     const d = await api('GET', '/accounts');
     const list = d.data.accounts;
     _lastAccountList = list || [];
+    const view = filteredAccountList(); // 搜索后的视图
     const tbody = _('accountTableBody');
     const cards = _('accountCards');
+    const sc = _('accSearchCount');
+    if (sc) sc.textContent = _accSearch ? (t('匹配') + ' ' + view.length + ' / ' + (_lastAccountList.length || 0)) : '';
     // 勾选状态跟随列表清理（已删除的账号从勾选中移除）
     if (list) {
       const ids = new Set(list.map(a => a.accountId));
       [..._checkedAccounts].forEach(id => { if (!ids.has(id)) _checkedAccounts.delete(id); });
     }
-    if (!list || list.length === 0) {
+    if (!view || view.length === 0) {
       _accPage = 1;
       _('accountPager').style.display = 'none';
       updateSelCount();
-      tbody.innerHTML = '<tr><td colspan="12" class="empty">👋 还没有账号 — 前往 <a href="#" onclick="switchTab(\'import\')" style="color:var(--accent);cursor:pointer">' + t('导入账号') + '</a> ' + t('添加你的第一个 Cline 账号') + '</td></tr>';
-      cards.innerHTML = '<div class="empty">👋 还没有账号 — 前往 <a href="#" onclick="switchTab(\'import\')" style="color:var(--accent)">' + t('导入账号') + '</a> ' + t('添加你的第一个 Cline 账号') + '</div>';
+      tbody.innerHTML = '<tr><td colspan="12" class="empty">' + (_accSearch ? (t('没有匹配的账号') + '："' + esc(_accSearch) + '"') : ('👋 还没有账号 — 前往 <a href="#" onclick="switchTab(\'import\')" style="color:var(--accent);cursor:pointer">' + t('导入账号') + '</a> ' + t('添加你的第一个 Cline 账号'))) + '</td></tr>';
+      cards.innerHTML = '<div class="empty">' + (_accSearch ? (t('没有匹配的账号') + '："' + esc(_accSearch) + '"') : ('👋 还没有账号 — 前往 <a href="#" onclick="switchTab(\'import\')" style="color:var(--accent)">' + t('导入账号') + '</a> ' + t('添加你的第一个 Cline 账号'))) + '</div>';
       return;
     }
     // 分页：前端切片，页码越界时收敛
-    const totalPages = Math.max(1, Math.ceil(list.length / _accPageSize));
+    const totalPages = Math.max(1, Math.ceil(view.length / _accPageSize));
     if (_accPage > totalPages) _accPage = totalPages;
     if (_accPage < 1) _accPage = 1;
     const start = (_accPage - 1) * _accPageSize;
-    const pageList = list.slice(start, start + _accPageSize);
+    const pageList = view.slice(start, start + _accPageSize);
     updateSelCount();
-    renderAccountPager(list.length);
+    renderAccountPager(view.length);
     const sn = { active: t('活跃'), cooldown: t('冷却'), expired: t('已过期') };
     // 模型统计子行（仅 free 模型 + 模型级冷却状态）
     const modelStatsRow = a => {
@@ -1984,7 +2046,7 @@ function onSelAccount(id, checked) {
 // 全选/全不选当前页：优先用缓存列表；缓存为空（刚删除/导出后尚未刷新）时
 // 退回当前渲染行上的勾选框（从 onchange="onSelAccount('id',...)" 解析账号 ID）。
 function toggleAllAccountSel(box) {
-  const list = _lastAccountList || [];
+  const list = filteredAccountList();
   const totalPages = Math.max(1, Math.ceil(list.length / _accPageSize));
   const p = Math.min(_accPage, totalPages);
   const chunk = list.slice((p - 1) * _accPageSize, p * _accPageSize);
@@ -2012,11 +2074,12 @@ function toggleAllAccountSel(box) {
 // 勾选计数徽标：同时根据当前页是否全部勾选来同步“全选”框，避免勾上后被强制重置
 function updateSelCount() {
   const n = _checkedAccounts.size;
-  const sel = _('selCount'), del = _('delCount'), all = _('accSelAll');
+  const sel = _('selCount'), del = _('delCount'), reset = _('resetCount'), all = _('accSelAll');
   if (sel) sel.textContent = n ? ' (' + n + ')' : '';
   if (del) del.textContent = n ? ' (' + n + ')' : '';
+  if (reset) reset.textContent = n ? ' (' + n + ')' : '';
   if (all) {
-    const list = _lastAccountList || [];
+    const list = filteredAccountList();
     const totalPages = Math.max(1, Math.ceil(list.length / _accPageSize));
     const p = Math.min(_accPage, totalPages);
     const chunk = list.slice((p - 1) * _accPageSize, p * _accPageSize);
@@ -2049,6 +2112,25 @@ async function exportSelectedAccounts() {
 }
 
 // 删除勾选的账号（逐个调用现有删除接口，带确认）
+// 重置勾选的账号（逐个调用现有重置接口，清除冷却/失败计数）
+async function resetSelectedAccounts(btn) {
+  const ids = [..._checkedAccounts];
+  if (!ids.length) { toast(t('请先勾选要重置的账号'), 'info'); return; }
+  if (!confirm(t('确认重置选中的 ') + ids.length + t(' 个账号？（清除冷却与失败计数）'))) return;
+  const orig = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="loading"></span> ' + t('重置中...'); }
+  let ok = 0, fail = 0;
+  for (const id of ids) {
+    try { await api('POST', '/accounts/reset', { accountId: id }); ok++; }
+    catch (e) { fail++; }
+  }
+  _checkedAccounts.clear();
+  if (btn) { btn.disabled = false; btn.innerHTML = orig; }
+  if (fail) toast(t('已重置 ') + ok + t(' 个，失败 ') + fail + t(' 个'), 'error');
+  else toast(t('已重置 ') + ok + t(' 个账号'), 'success');
+  await loadAccounts();
+}
+
 async function deleteSelectedAccounts(btn) {
   const ids = [..._checkedAccounts];
   if (!ids.length) { toast(t('请先勾选要删除的账号'), 'info'); return; }
