@@ -595,6 +595,10 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 			reqLog.Model = effectiveModel // 含回退后的实际服务模型
 		}
 		stampUpstream(&reqLog, chat) // 归因实际服务方（provider / opencode / cline）
+		if acc != nil {
+			reqLog.AccountID = acc.AccountID
+			reqLog.AccountEmail = acc.Email // 失败也要记账号：否则日志显示不出实际被 402/429 的账号
+		}
 		if err != nil {
 			log.Printf("  responses api error: %v", err)
 			finalizeRequestLog(&reqLog, tokenUsage{}, time.Time{}, reqLog.StartedAt, false, err.Error())

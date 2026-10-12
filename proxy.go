@@ -590,6 +590,10 @@ func startProxy(host string, port int) error {
 			reqLog.Model = effectiveModel // 含回退后的实际服务模型
 		}
 		stampUpstream(&reqLog, params) // 归因实际服务方（provider / opencode / cline）
+		if acc != nil {
+			reqLog.AccountID = acc.AccountID
+			reqLog.AccountEmail = acc.Email // 失败也要记账号：否则日志显示不出实际被 402/429 的账号
+		}
 		if err != nil {
 			log.Printf("  api error: %v", err)
 			finalizeRequestLog(&reqLog, tokenUsage{}, time.Time{}, reqLog.StartedAt, false, err.Error())
@@ -1190,8 +1194,17 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 				continue
 			}
 			apiErr, ok := err.(*clineAPIError)
+			if ok && apiErr.statusCode == http.StatusPaymentRequired {
+				// 402 余额不足是账号级问题（该账号扣费额度耗尽），不是模型级：
+				// 冷却该账号上的这个模型（30min），换下一个账号继续试当前模型。
+				// 不换账号会导致轮询反复选中同一破产账号，每个请求先烧一次 402 往返；
+				// 不能整账号冷却 —— 同账号上仍在免费列表的模型零成本可用。
+				setModelCooldown(usedAcc, m, time.Now().Add(30*time.Minute))
+				log.Printf("  model %q on %s: insufficient credits (402), cooling for 30m, trying next account", m, usedAcc.Email)
+				continue
+			}
 			if !ok || apiErr.statusCode != http.StatusTooManyRequests {
-				// 非 429 错误：若后面还有候选（provider / 链）则继续降级，否则透传
+				// 非 429/402 错误：若后面还有候选（provider / 链）则继续降级，否则透传
 				if !hasAnyFallbackLeft(model, m) {
 					return nil, usedAcc, err
 				}
@@ -1456,8 +1469,13 @@ func callFreeClineAPI(params map[string]any, stream bool) (*http.Response, *Acco
 			}
 			lastErr = err
 			lastWas429 = false
-			if apiErr, ok := err.(*clineAPIError); ok && apiErr.statusCode == http.StatusTooManyRequests {
-				// 429 限流：换下一个账号继续试当前模型
+			if apiErr, ok := err.(*clineAPIError); ok && (apiErr.statusCode == http.StatusTooManyRequests || apiErr.statusCode == http.StatusPaymentRequired) {
+				// 429 限流 / 402 余额不足：都是账号级问题 —— 402 冷却该账号上的
+				// 这个模型后换下一个账号继续试，不能换模型（其他账号可能还有额度）
+				if apiErr.statusCode == http.StatusPaymentRequired {
+					setModelCooldown(acc, model, time.Now().Add(30*time.Minute))
+					log.Printf("  model %q on %s: insufficient credits (402), cooling for 30m, trying next account", model, acc.Email)
+				}
 				lastWas429 = true
 				continue
 			}
@@ -2642,6 +2660,10 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		reqLog.Model = effectiveModel // 含回退后的实际服务模型
 	}
 	stampUpstream(&reqLog, openAIReq) // 归因实际服务方（provider / opencode / cline）
+	if acc != nil {
+		reqLog.AccountID = acc.AccountID
+		reqLog.AccountEmail = acc.Email // 失败也要记账号
+	}
 	if err != nil {
 		log.Printf("  anthropic api error: %v", err)
 		finalizeRequestLog(&reqLog, tokenUsage{}, time.Time{}, reqLog.StartedAt, false, err.Error())
