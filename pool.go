@@ -236,10 +236,58 @@ func savePool() {
 	}
 }
 
+// addAccount 添加账号。同一邮箱（不区分大小写，来自 Cline userInfo，即同一
+// Cline 账号）已存在时**原地更新凭据**：重新授权/重复导入不该产生重复条目 ——
+// 保留原 AccountID、创建时间与用量统计，只更新令牌并置回 active。
+// 已存在的同邮箱重复条目（历史遗留）一并合并进首个条目后移除（用量计数求和）。
 func addAccount(acc *Account) {
 	p := loadPool()
 	poolMu.Lock()
-	p.Accounts = append(p.Accounts, acc)
+	newEmail := strings.TrimSpace(acc.Email)
+	var kept *Account
+	var dups []*Account
+	for _, a := range p.Accounts {
+		if newEmail != "" && strings.EqualFold(strings.TrimSpace(a.Email), newEmail) {
+			if kept == nil {
+				kept = a
+			} else {
+				dups = append(dups, a)
+			}
+		}
+	}
+	if kept != nil {
+		kept.RefreshToken = acc.RefreshToken
+		kept.AccessToken = acc.AccessToken
+		kept.ExpiresAt = acc.ExpiresAt
+		kept.Status = "active"
+		if len(dups) > 0 {
+			for _, d := range dups {
+				kept.UsageCount += d.UsageCount
+				kept.PromptTokens += d.PromptTokens
+				kept.CompletionTokens += d.CompletionTokens
+				kept.TotalTokens += d.TotalTokens
+				kept.CachedTokens += d.CachedTokens
+			}
+			out := p.Accounts[:0]
+			for _, a := range p.Accounts {
+				isDup := false
+				for _, d := range dups {
+					if a == d {
+						isDup = true
+						break
+					}
+				}
+				if !isDup {
+					out = append(out, a)
+				}
+			}
+			p.Accounts = out
+			log.Printf("Account %s: merged %d duplicate entr(y/ies), stats preserved", acc.Email, len(dups))
+		}
+		log.Printf("Account re-authorized in place: %s (AccountID/stats preserved)", acc.Email)
+	} else {
+		p.Accounts = append(p.Accounts, acc)
+	}
 	poolMu.Unlock()
 	savePool()
 }
