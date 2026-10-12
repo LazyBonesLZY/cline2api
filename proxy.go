@@ -917,6 +917,7 @@ func numericInt(value any) (int, bool) {
 		return 0, false
 	}
 }
+
 // modelMaxOutputLimit 返回模型已知的最大输出 token 硬上限（0=未知，不封顶）。
 // 已知硬限制表优先（gemini-3.8-flash 等）；其次取池中该模型的 Output 元数据
 // （remote 同步 / 管理页设置 / 用户自定义模型）。zen 模型的 Output 是压缩预算
@@ -2968,7 +2969,8 @@ L:
 					log.Printf("  anthropic stream: upstream sent empty stream before any content")
 					return false
 				}
-				continue			}
+				continue
+			}
 
 			var obj map[string]any
 			if err := json.Unmarshal([]byte(payload), &obj); err != nil {
@@ -2979,6 +2981,8 @@ L:
 					obj = d
 				}
 			}
+			// 回程还原出站截短的工具名（Meta 后端硬限 ≤64 的映射）
+			restoreToolCallsInResponse(obj, reqLog.toolNames)
 			if usage := parseTokenUsage(obj["usage"]); usage.Valid {
 				latestUsage = mergeTokenUsage(latestUsage, usage)
 			}
