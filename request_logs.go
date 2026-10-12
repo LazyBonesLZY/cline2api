@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"sort"
 	"sync"
@@ -61,6 +62,7 @@ func loadRequestLogs() {
 	}
 	var entries []RequestLog
 	if err := json.Unmarshal(data, &entries); err != nil {
+		backupCorruptFile(requestLogsPath, err)
 		return
 	}
 	requestLogsMu.Lock()
@@ -98,11 +100,9 @@ func saveRequestLogsLocked() {
 	if err != nil {
 		return
 	}
-	tmp := requestLogsPath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
-		return
+	if err := writeFileAtomic(requestLogsPath, data, 0600); err != nil {
+		log.Printf("request logs save failed: %v", err)
 	}
-	_ = os.Rename(tmp, requestLogsPath)
 }
 
 func appendRequestLog(entry RequestLog) {

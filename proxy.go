@@ -179,12 +179,22 @@ func getDefaultModel() string {
 
 	// 管理员设置的默认模型也会随上游下架而失效：远程同步已启用却查不到时
 	// 视为已下架，落到下方「第一个远程免费模型」，避免每个无模型请求必败。
-	if p.DefaultModel != "" && (!remoteModelsActive() || liveModelSet(p)[p.DefaultModel]) {
-		return p.DefaultModel
+	// 被管理员手动停用的默认模型同样跳过（含离线模式）。
+	if p.DefaultModel != "" {
+		defaultDisabled := false
+		for _, m := range p.Models {
+			if m.ID == p.DefaultModel && m.Disabled {
+				defaultDisabled = true
+				break
+			}
+		}
+		if !defaultDisabled && (!remoteModelsActive() || liveModelSet(p)[p.DefaultModel]) {
+			return p.DefaultModel
+		}
 	}
 
 	for _, m := range p.Models {
-		if m.Source == "remote" && m.Cost == "free" {
+		if m.Source == "remote" && m.Cost == "free" && !m.Disabled {
 			return m.ID
 		}
 	}
@@ -194,7 +204,7 @@ func getDefaultModel() string {
 	// 已下架时会让每个无模型请求必败）。
 	if remoteModelsActive() {
 		for _, m := range p.Models {
-			if m.Status == "active" {
+			if m.Status == "active" && !m.Disabled {
 				return m.ID
 			}
 		}
@@ -331,6 +341,7 @@ func isFreeModelEntry(m Model) bool {
 }
 
 func startProxy(host string, port int) error {
+	log.Printf("Data directory: %s (set %s to override)", currentDataDir(), dataDirEnv)
 	p := loadPool()
 	loadRequestLogs()
 	activeCount := 0
@@ -422,6 +433,10 @@ func startProxy(host string, port int) error {
 		all := getAllModels()
 		list := make([]map[string]any, 0, len(all))
 		for _, m := range all {
+			// 管理员手动停用的模型不进客户端模型列表
+			if m.Disabled {
+				continue
+			}
 			if onlyFree && !isFreeModelEntry(m) {
 				continue
 			}
@@ -472,6 +487,15 @@ func startProxy(host string, port int) error {
 		}
 		model, _ := params["model"].(string)
 		log.Printf("  client: stream=%v tools=%d model=%s", isStream, toolCount, model)
+
+		// 管理员手动停用的模型在入口直接拒绝（不进列表，也不可点名调用）
+		if model != "" && isModelDisabled(model) {
+			msg := "model " + model + " is disabled"
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": map[string]string{"message": msg, "type": "invalid_request_error"},
+			})
+			return
+		}
 
 		reqLog := RequestLog{StartedAt: time.Now(), Protocol: "openai", Model: model, Stream: isStream}
 
@@ -1266,11 +1290,15 @@ func defaultFreeChain() []string {
 }
 
 // liveModelSet 返回当前仍然「在线」的模型 ID 集合：池内全部模型（远程同步
-// remote / opencode zen 同步 / 管理员自定义）+ 启用中自定义 provider 声明的模型。
+// remote / opencode zen 同步 / 管理员自定义，已手动停用的除外）+ 启用中自定义
+// provider 声明的模型。
 // 调用方须持有 poolMu；providers 走独立的 providersMu，仓库内不存在反向持锁路径。
 func liveModelSet(p *AccountPool) map[string]bool {
 	live := make(map[string]bool, len(p.Models))
 	for _, m := range p.Models {
+		if m.Disabled {
+			continue
+		}
 		live[m.ID] = true
 	}
 	for _, sp := range listProviders() {
@@ -1282,6 +1310,26 @@ func liveModelSet(p *AccountPool) map[string]bool {
 		}
 	}
 	return live
+}
+
+// isModelDisabled 判断模型是否被管理员在管理页手动停用（Disabled 标记）。
+// 支持 "opencode/" 前缀别名（与 routeModel 的匹配方式一致）。
+// 停用语义：不进客户端模型列表、直接请求在入口处拒绝、默认模型与回退链跳过。
+func isModelDisabled(id string) bool {
+	id = strings.TrimSpace(id)
+	id = strings.TrimPrefix(id, "opencode/")
+	if id == "" {
+		return false
+	}
+	p := loadPool()
+	poolMu.Lock()
+	defer poolMu.Unlock()
+	for _, m := range p.Models {
+		if m.ID == id && m.Disabled {
+			return true
+		}
+	}
+	return false
 }
 
 // filterStaleModels 从回退链里剔除已下架的模型。
@@ -2440,6 +2488,16 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	log.Printf("  anthropic: model=%s stream=%v msgs=%d", req.Model, req.Stream, len(req.Messages))
 
 	reqLog := RequestLog{StartedAt: time.Now(), Protocol: "anthropic", Model: req.Model, Stream: req.Stream}
+
+	// 管理员手动停用的模型在入口直接拒绝（不进列表，也不可点名调用）
+	if req.Model != "" && isModelDisabled(req.Model) {
+		msg := fmt.Sprintf("model %q is disabled", req.Model)
+		finalizeRequestLog(&reqLog, tokenUsage{}, time.Time{}, reqLog.StartedAt, false, msg)
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": map[string]string{"message": msg, "type": "invalid_request_error"},
+		})
+		return
+	}
 
 	// 按 model 自动分流（与 chat 端点一致）：zen 免费/付费拒绝/Cline 池
 	switch routeModel(req.Model) {

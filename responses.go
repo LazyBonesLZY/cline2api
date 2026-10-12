@@ -482,6 +482,14 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	isStream, _ := params["stream"].(bool)
 	log.Printf("  responses: model=%s stream=%v", model, isStream)
 
+	// 管理员手动停用的模型在入口直接拒绝（不进列表，也不可点名调用）
+	if model != "" && isModelDisabled(model) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "model " + model + " is disabled",
+		})
+		return
+	}
+
 	reqLog := RequestLog{StartedAt: time.Now(), Protocol: "responses", Model: model, Stream: isStream}
 
 	chat := responsesToChat(params)

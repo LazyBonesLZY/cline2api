@@ -71,6 +71,11 @@ func init() {
 }
 
 func findCredentialsFile() string {
+	// CLINE2API_DATA_DIR 设置时固定使用该目录（与 resolveDataPath 保持一致）
+	if dir := envDataDir(); dir != "" {
+		migrateOnce.Do(func() { migrateLegacyDataFiles(dir) })
+		return filepath.Join(dir, ".cline-credentials.json")
+	}
 	// First, try next to the executable
 	exe, err := os.Executable()
 	if err == nil {
@@ -115,7 +120,7 @@ func loadCredentials() *credentials {
 func saveCredentials(rt string) {
 	c := credentials{RefreshToken: rt}
 	data, _ := json.MarshalIndent(c, "", "  ")
-	if err := os.WriteFile(credentialsPath, data, 0600); err != nil {
+	if err := writeFileAtomic(credentialsPath, data, 0600); err != nil {
 		log.Printf("Failed to save credentials: %v", err)
 		return
 	}

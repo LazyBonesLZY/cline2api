@@ -293,9 +293,10 @@ func getZenConfig() *zenConfigData {
 	defer zenConfigMu.Unlock()
 	if zenConfig == nil {
 		cfg := defaultZenConfig()
-		if data, err := os.ReadFile(resolveDataPath(".cline-zen.json")); err == nil {
+		zenPath := resolveDataPath(".cline-zen.json")
+		if data, err := os.ReadFile(zenPath); err == nil {
 			if err := json.Unmarshal(data, cfg); err != nil {
-				log.Printf("zen config parse failed: %v", err)
+				backupCorruptFile(zenPath, err)
 			}
 		}
 		if cfg.Key == "" {
@@ -335,7 +336,7 @@ func setZenConfig(c *zenConfigData) {
 	zenConfigMu.Unlock()
 
 	data, _ := json.MarshalIndent(c, "", "  ")
-	if err := os.WriteFile(resolveDataPath(".cline-zen.json"), data, 0600); err != nil {
+	if err := writeFileAtomic(resolveDataPath(".cline-zen.json"), data, 0600); err != nil {
 		log.Printf("zen config save failed: %v", err)
 	}
 	// 关闭故障转移时立即解除已武装的窗口：否则 UI 仍显示“故障转移中”，
@@ -1186,10 +1187,14 @@ func syncZenModels() modelSyncResult {
 		}
 	}
 	fillMeta := func(m Model) Model {
-		if om, ok := oldZen[m.ID]; ok && om.MetaLocked && om.Context > 0 {
-			m.Context, m.Output = om.Context, om.Output
-			m.MetaLocked = true
-			return m
+		if om, ok := oldZen[m.ID]; ok {
+			// 用户手动停用的模型在重建条目时保留标记，避免同步冲掉停用状态
+			m.Disabled = om.Disabled
+			if om.MetaLocked && om.Context > 0 {
+				m.Context, m.Output = om.Context, om.Output
+				m.MetaLocked = true
+				return m
+			}
 		}
 		for _, sm := range zenSeedModels {
 			if sm.ID == m.ID {
