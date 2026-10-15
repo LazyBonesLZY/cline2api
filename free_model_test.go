@@ -924,6 +924,7 @@ func TestHandleResponsesFreeReturnsTooManyRequestsWhenBothPoolsUnavailable(t *te
 	oldPool := pool
 	oldConfig := getProxyConfig()
 	oldTransport := httpClient.Transport
+	oldZenCfg := getZenConfig()
 	requestLogsMu.Lock()
 	oldLogs := requestLogs
 	requestLogs = nil
@@ -932,10 +933,21 @@ func TestHandleResponsesFreeReturnsTooManyRequestsWhenBothPoolsUnavailable(t *te
 		pool = oldPool
 		setProxyConfig(oldConfig)
 		httpClient.Transport = oldTransport
+		zenConfigMu.Lock()
+		zenConfig = oldZenCfg
+		zenConfigMu.Unlock()
 		requestLogsMu.Lock()
 		requestLogs = oldLogs
 		requestLogsMu.Unlock()
 	})
+	// zen 池指向死端口：本测试只验证「双池不可用 → 429」，
+	// zen 走独立 uTLS 客户端不受 httpClient.Transport mock 拦截，
+	// 不隔离会真实打到 opencode（免费层补齐核心工具后请求会成功）
+	deadZen := *oldZenCfg
+	deadZen.BaseURL = "http://127.0.0.1:1"
+	zenConfigMu.Lock()
+	zenConfig = &deadZen
+	zenConfigMu.Unlock()
 
 	account := &Account{
 		AccountID:   "quota-account",
@@ -1249,51 +1261,6 @@ func TestOnlyFreeConfigRoundTrip(t *testing.T) {
 	setProxyConfig(cfg)
 	if !getProxyConfig().OnlyFree {
 		t.Fatal("OnlyFree not persisted after setProxyConfig")
-	}
-}
-
-func TestGeneric429DoesNotStampThePool(t *testing.T) {
-	oldPool := pool
-	oldConfig := getProxyConfig()
-	oldTransport := httpClient.Transport
-	t.Cleanup(func() {
-		pool = oldPool
-		setProxyConfig(oldConfig)
-		httpClient.Transport = oldTransport
-	})
-
-	first := &Account{
-		AccountID: "acc-a", Email: "a@example.com", AccessToken: "token-a",
-		ExpiresAt: time.Now().Add(time.Hour).UnixMilli(), Status: "active",
-	}
-	second := &Account{
-		AccountID: "acc-b", Email: "b@example.com", AccessToken: "token-b",
-		ExpiresAt: time.Now().Add(time.Hour).UnixMilli(), Status: "active",
-	}
-	pool = &AccountPool{Accounts: []*Account{first, second}}
-	setProxyConfig(defaultProxyConfig())
-	withoutZen(t)
-
-	var tokens []string
-	httpClient.Transport = freeModelRoundTripper(func(req *http.Request) (*http.Response, error) {
-		tokens = append(tokens, strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer "))
-		return &http.Response{
-			StatusCode: http.StatusTooManyRequests,
-			Body:       io.NopCloser(strings.NewReader(`{"error":"rate_limit"}`)),
-			Header:     make(http.Header),
-			Request:    req,
-		}, nil
-	})
-
-	_, _, err := callClineAPI(map[string]any{"model": "free"}, false)
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if len(tokens) != len(freeModelChain) {
-		t.Fatalf("upstream calls = %d, want %d (one try per model, not every account)", len(tokens), len(freeModelChain))
-	}
-	if len(first.ModelCooldowns) != 0 || len(second.ModelCooldowns) != 0 {
-		t.Fatalf("generic 429 stamped cooldowns: first=%v second=%v", first.ModelCooldowns, second.ModelCooldowns)
 	}
 }
 

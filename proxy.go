@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -34,6 +36,9 @@ const (
 	freeModelPrimary       = "z-ai/glm-5.3-flash"
 	freeModelFallback      = "deepseek/deepseek-v4-flash"
 	freeModelLastResort    = "cline-free/longcat-2.0"
+	// maxUpstreamToolNameLength 上游对工具 function.name 的长度上限：OpenRouter 的
+	// Meta provider 硬限 `name` ≤64 字符，超长请求间歇性 400（取决于轮询到的后端）。
+	maxUpstreamToolNameLength = 64
 )
 
 // minUpstreamMaxTokens 上游对输出 token 的硬下限：Cline 免费模型经 OpenRouter
@@ -238,12 +243,22 @@ func getDefaultModel() string {
 
 	// 管理员设置的默认模型也会随上游下架而失效：远程同步已启用却查不到时
 	// 视为已下架，落到下方「第一个远程免费模型」，避免每个无模型请求必败。
-	if p.DefaultModel != "" && (!remoteModelsActive() || liveModelSet(p)[p.DefaultModel]) {
-		return p.DefaultModel
+	// 被管理员手动停用的默认模型同样跳过（含离线模式）。
+	if p.DefaultModel != "" {
+		defaultDisabled := false
+		for _, m := range p.Models {
+			if m.ID == p.DefaultModel && m.Disabled {
+				defaultDisabled = true
+				break
+			}
+		}
+		if !defaultDisabled && (!remoteModelsActive() || liveModelSet(p)[p.DefaultModel]) {
+			return p.DefaultModel
+		}
 	}
 
 	for _, m := range p.Models {
-		if m.Source == "remote" && m.Cost == "free" {
+		if m.Source == "remote" && m.Cost == "free" && !m.Disabled {
 			return m.ID
 		}
 	}
@@ -253,7 +268,7 @@ func getDefaultModel() string {
 	// 已下架时会让每个无模型请求必败）。
 	if remoteModelsActive() {
 		for _, m := range p.Models {
-			if m.Status == "active" {
+			if m.Status == "active" && !m.Disabled {
 				return m.ID
 			}
 		}
@@ -390,6 +405,7 @@ func isFreeModelEntry(m Model) bool {
 }
 
 func startProxy(host string, port int) error {
+	log.Printf("Data directory: %s (set %s to override)", currentDataDir(), dataDirEnv)
 	p := loadPool()
 	loadRequestLogs()
 	activeCount := 0
@@ -481,6 +497,10 @@ func startProxy(host string, port int) error {
 		all := getAllModels()
 		list := make([]map[string]any, 0, len(all))
 		for _, m := range all {
+			// 管理员手动停用的模型不进客户端模型列表
+			if m.Disabled {
+				continue
+			}
 			if onlyFree && !isFreeModelEntry(m) {
 				continue
 			}
@@ -537,6 +557,15 @@ func startProxy(host string, port int) error {
 		}
 		log.Printf("  client: stream=%v tools=%d model=%s", isStream, toolCount, model)
 
+		// 管理员手动停用的模型在入口直接拒绝（不进列表，也不可点名调用）
+		if model != "" && isModelDisabled(model) {
+			msg := "model " + model + " is disabled"
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": map[string]string{"message": msg, "type": "invalid_request_error"},
+			})
+			return
+		}
+
 		reqLog := RequestLog{StartedAt: time.Now(), Protocol: "openai", Model: model, Stream: isStream}
 
 		// Override system prompt from override.md for OpenAI format
@@ -583,6 +612,8 @@ func startProxy(host string, port int) error {
 			}
 			resp, err := callZenAPI(params, isStream)
 			if err != nil {
+				// zen 故障转移到 Cline 池：先截短超长工具名（Meta 后端硬限 ≤64）
+				reqLog.toolNames = clampParamsToolNames(params)
 				if fbResp, fbAcc, fbErr, attempted := zenFailoverToCline(params, isStream); attempted {
 					if fbErr == nil {
 						log.Printf("  chat failover: serving %q via cline pool", model)
@@ -628,11 +659,17 @@ func startProxy(host string, port int) error {
 			return
 		}
 
+		// Cline 通道：截短超长工具名并记录映射，回程由响应处理器还原（Meta 后端硬限 ≤64）
+		reqLog.toolNames = clampParamsToolNames(params)
 		resp, acc, err := callClineAPI(params, isStream)
 		if effectiveModel, ok := params["model"].(string); ok && effectiveModel != "" {
 			reqLog.Model = effectiveModel // 含回退后的实际服务模型
 		}
 		stampUpstream(&reqLog, params) // 归因实际服务方（provider / opencode / cline）
+		if acc != nil {
+			reqLog.AccountID = acc.AccountID
+			reqLog.AccountEmail = acc.Email // 失败也要记账号：否则日志显示不出实际被 402/429 的账号
+		}
 		if err != nil {
 			log.Printf("  api error: %v", err)
 			finalizeRequestLog(&reqLog, tokenUsage{}, time.Time{}, reqLog.StartedAt, false, err.Error())
@@ -753,6 +790,127 @@ func cleanMessages(messages []any) []any {
 		cleaned = append(cleaned, msg)
 	}
 	return cleaned
+}
+
+// shortenToolName 把超长工具名确定性截短到 ≤64 字符：前 55 字节 + "_" + 8 位 sha256。
+// 确定性保证同一原始名跨请求映射稳定，多轮历史中的 tool_calls 名称不会漂移。
+func shortenToolName(orig string) string {
+	sum := sha256.Sum256([]byte(orig))
+	return fmt.Sprintf("%.55s_%x", orig, sum[:4])
+}
+
+// clampParamsToolNames 把 Cline 请求里超过 64 字符的工具名截短：tools 定义与
+// 历史 assistant tool_calls 同步改写（保留 tool_call_id 关联，OpenAI 协议按 id 配对）。
+// 返回 短→原始 映射存入 reqLog 供回程还原；无超长名时返回 nil。
+// 每请求只在入口调用一次，重试/故障转移链复用已改写的 params，不重复调用。
+func clampParamsToolNames(params map[string]any) map[string]string {
+	shortToOrig := map[string]string{}
+	clamped := false
+	ensure := func(orig string) string {
+		if len(orig) <= maxUpstreamToolNameLength {
+			return orig
+		}
+		short := shortenToolName(orig)
+		shortToOrig[short] = orig
+		clamped = true
+		return short
+	}
+	renameToolCalls := func(tcs []any) {
+		for _, tc := range tcs {
+			tcm, ok := tc.(map[string]any)
+			if !ok {
+				continue
+			}
+			fn, ok := tcm["function"].(map[string]any)
+			if !ok {
+				continue
+			}
+			if name, _ := fn["name"].(string); name != "" {
+				fn["name"] = ensure(name)
+			}
+		}
+	}
+	if tools, ok := params["tools"].([]any); ok {
+		for _, t := range tools {
+			tm, ok := t.(map[string]any)
+			if !ok {
+				continue
+			}
+			fn, ok := tm["function"].(map[string]any)
+			if !ok {
+				continue
+			}
+			if name, _ := fn["name"].(string); name != "" {
+				fn["name"] = ensure(name)
+			}
+		}
+	}
+	if msgs, ok := params["messages"].([]any); ok {
+		for _, mv := range msgs {
+			mm, ok := mv.(map[string]any)
+			if !ok {
+				continue
+			}
+			if tcs, ok := mm["tool_calls"].([]any); ok {
+				renameToolCalls(tcs)
+			}
+		}
+	}
+	// tool_choice 指定函数名时同样受限；响应不回显该字段，无需还原
+	if tcChoice, ok := params["tool_choice"].(map[string]any); ok {
+		if fn, ok := tcChoice["function"].(map[string]any); ok {
+			if name, _ := fn["name"].(string); name != "" {
+				fn["name"] = ensure(name)
+			}
+		}
+	}
+	if !clamped {
+		return nil
+	}
+	return shortToOrig
+}
+
+// restoreToolCallsInResponse 把上游响应里被截短的工具名还原为客户端原始名，
+// 覆盖流式 delta 与非流式 message 两种形态；映射为空时是 no-op。
+func restoreToolCallsInResponse(obj map[string]any, shortToOrig map[string]string) {
+	if obj == nil || len(shortToOrig) == 0 {
+		return
+	}
+	choices, ok := obj["choices"].([]any)
+	if !ok {
+		return
+	}
+	for _, c := range choices {
+		cm, ok := c.(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, key := range []string{"delta", "message"} {
+			d, ok := cm[key].(map[string]any)
+			if !ok {
+				continue
+			}
+			tcs, ok := d["tool_calls"].([]any)
+			if !ok {
+				continue
+			}
+			for _, tc := range tcs {
+				tcm, ok := tc.(map[string]any)
+				if !ok {
+					continue
+				}
+				fn, ok := tcm["function"].(map[string]any)
+				if !ok {
+					continue
+				}
+				if name, _ := fn["name"].(string); name != "" {
+					if orig, ok := shortToOrig[name]; ok {
+						fn["name"] = orig
+					}
+				}
+			}
+		}
+	}
 }
 
 // sanitizeMessages 修复出站消息历史中的畸形 tool_calls。
@@ -1087,9 +1245,17 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 	if model == "free" {
 		resp, acc, err := callFreeClineAPI(params, stream)
 		if err != nil {
-			// Cline 残血池整条链耗尽（429 冷却/无账号）→ 落到 zen 免费模型
-			if fbResp, attempted := clineFailoverToZen(params, stream); attempted {
+			// Cline 残血池整条链耗尽（429 冷却/无账号）→ 落到 zen 免费模型。
+			// 转移前记下链尾实际模型：没有任何 zen 模型服务成功时还原，
+			// 否则请求日志会把失败请求记成最后一个 zen 尝试的模型
+			// （链尾 cline 模型才是实际归宿）。
+			lastChainModel, _ := params["model"].(string)
+			fbResp, _ := clineFailoverToZen(params, stream)
+			if fbResp != nil {
 				return fbResp, nil, nil
+			}
+			if lastChainModel != "" {
+				params["model"] = lastChainModel
 			}
 		}
 		return resp, acc, err
@@ -1162,23 +1328,28 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 				continue
 			}
 			apiErr, ok := err.(*clineAPIError)
-			// 该账号未订阅此模型（403 ENTITLEMENT）：冷却已记下，换下一个候选账号。
-			// 必须早于下面的 isUpstreamClientError 判定——403 是 4xx，但它是账号问题，
+			// 该账号未订阅此模型（403 ENTITLEMENT）：账号级问题，冷却已记下，
+			// 换下一个候选账号。必须早于 4xx 判定——403 是 4xx，但它是账号问题，
 			// 当成请求错误透传正是这个 bug 的成因。
 			if ok && apiErr.entitlement {
 				denied++
 				continue
 			}
-			// 4xx（除 429）是请求本身的问题，换模型只会把参数错误伪装成另一个模型的成功。
+			if ok && apiErr.statusCode == http.StatusPaymentRequired {
+				// 402 余额不足是账号级问题（该账号扣费额度耗尽），不是模型级：
+				// 冷却该账号上的这个模型（30min），换下一个账号继续试当前模型。
+				// 不换账号会导致轮询反复选中同一破产账号，每个请求先烧一次 402 往返；
+				// 不能整账号冷却 —— 同账号上仍在免费列表的模型零成本可用。
+				setModelCooldown(usedAcc, m, time.Now().Add(30*time.Minute))
+				log.Printf("  model %q on %s: insufficient credits (402), cooling for 30m, trying next account", m, usedAcc.Email)
+				continue
+			}
+			// 4xx（除 402/429）是请求本身的问题：换模型只会把参数错误伪装成另一个模型的成功。
 			if ok && isUpstreamClientError(apiErr.statusCode) {
 				return nil, usedAcc, err
 			}
-			if ok && apiErr.statusCode == http.StatusTooManyRequests && apiErr.quota {
-				// 该账号此模型额度用尽：冷却已记下，换下一个账号
-				continue
-			}
 			if !ok || apiErr.statusCode != http.StatusTooManyRequests {
-				// 5xx 等：若后面还有候选（provider / 链）则继续降级，否则透传
+				// 非 429 错误：若后面还有候选（provider / 链）则继续降级，否则透传
 				if !hasAnyFallbackLeft(model, m) {
 					return nil, usedAcc, err
 				}
@@ -1206,9 +1377,17 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 			return resp, acc, nil
 		}
 	}
-	// Cline 侧（含 free 链）全部耗尽 → 反向故障转移到 zen 免费模型
-	if fbResp, attempted := clineFailoverToZen(params, stream); attempted {
+	// Cline 侧（含 free 链）全部耗尽 → 反向故障转移到 zen 免费模型。
+	// 没有任何 zen 模型服务成功时还原模型名：请求日志按 params 记实际服务
+	// 模型，不能记成最后一次失败的 zen 尝试
+	fbResp, _ := clineFailoverToZen(params, stream)
+	if fbResp != nil {
 		return fbResp, nil, nil
+	}
+	// 没有任何候选成功时还原点名模型：请求日志按 params 记实际服务模型，
+	// 不能记成最后一次失败的 zen 尝试。
+	if model != "" {
+		params["model"] = model
 	}
 	// 点名模型（含链上所有候选）都被「未订阅」拒掉：明确告诉客户端是权限问题，
 	// 并指出处置方式，而不是伪装成 500 或限流。
@@ -1281,11 +1460,15 @@ func defaultFreeChain() []string {
 }
 
 // liveModelSet 返回当前仍然「在线」的模型 ID 集合：池内全部模型（远程同步
-// remote / opencode zen 同步 / 管理员自定义）+ 启用中自定义 provider 声明的模型。
+// remote / opencode zen 同步 / 管理员自定义，已手动停用的除外）+ 启用中自定义
+// provider 声明的模型。
 // 调用方须持有 poolMu；providers 走独立的 providersMu，仓库内不存在反向持锁路径。
 func liveModelSet(p *AccountPool) map[string]bool {
 	live := make(map[string]bool, len(p.Models))
 	for _, m := range p.Models {
+		if m.Disabled {
+			continue
+		}
 		live[m.ID] = true
 	}
 	for _, sp := range listProviders() {
@@ -1297,6 +1480,26 @@ func liveModelSet(p *AccountPool) map[string]bool {
 		}
 	}
 	return live
+}
+
+// isModelDisabled 判断模型是否被管理员在管理页手动停用（Disabled 标记）。
+// 支持 "opencode/" 前缀别名（与 routeModel 的匹配方式一致）。
+// 停用语义：不进客户端模型列表、直接请求在入口处拒绝、默认模型与回退链跳过。
+func isModelDisabled(id string) bool {
+	id = strings.TrimSpace(id)
+	id = strings.TrimPrefix(id, "opencode/")
+	if id == "" {
+		return false
+	}
+	p := loadPool()
+	poolMu.Lock()
+	defer poolMu.Unlock()
+	for _, m := range p.Models {
+		if m.ID == id && m.Disabled {
+			return true
+		}
+	}
+	return false
 }
 
 // filterStaleModels 从回退链里剔除已下架的模型。
@@ -1345,24 +1548,29 @@ func hasAnyFallbackLeft(requested, current string) bool {
 
 // modelFallbackChain 显式模型的降级序列：点名模型优先，其后是管理员配置的
 // 回退链（modelChain）；未配置时动态派生默认链（排除已下架模型）。均去重。
-// 配置链会先经 filterStaleModels 剔除已下架条目；点名模型本身始终保留——
-// 它是客户端显式要求的（可能由 zen / provider 服务，不归本仓判定）。
+// 用户显式配置的链**不做列表过滤**：官方列表之外常有实测仍可用的模型
+// （列表只是参考不是白名单），失效条目由请求时的模型级冷却与故障转移兜底；
+// 只有动态派生的免费链才按 liveModelSet 过滤下架条目。点名模型本身始终
+// 保留 —— 它是客户端显式要求的（可能由 zen / provider 服务，不归本仓判定）。
 // 故障转移关闭时只保留点名模型，失败直接返回，不再悄悄换成链上的另一个模型。
 func modelFallbackChain(requested string) []string {
 	if !getZenConfig().Failover {
 		return []string{requested}
 	}
 	configured := getProxyConfig().ModelChain
-	if len(configured) == 0 {
+	userConfigured := len(configured) > 0
+	if !userConfigured {
 		configured = defaultFreeChain()
+		configured = filterStaleModels(configured)
 	}
-	configured = filterStaleModels(configured)
-	chain := make([]string, 0, 1+len(configured))
-	chain = append(chain, requested)
+	seen := map[string]bool{requested: true}
+	chain := []string{requested}
 	for _, m := range configured {
-		if m != requested {
-			chain = append(chain, m)
+		if m == "" || seen[m] {
+			continue
 		}
+		seen[m] = true
+		chain = append(chain, m)
 	}
 	return chain
 }
@@ -1424,13 +1632,19 @@ func callFreeClineAPI(params map[string]any, stream bool) (*http.Response, *Acco
 			lastErr = err
 			lastWas429 = false
 			lastWasEntitlement = false
-			if apiErr, ok := err.(*clineAPIError); ok && apiErr.entitlement {
-				// 该账号未订阅此模型：冷却已记下，换下一个候选账号继续试
+			apiErr, ok := err.(*clineAPIError)
+			// 该账号未订阅此模型（403 ENTITLEMENT）：冷却已记下，换下一个候选账号继续试
+			if ok && apiErr.entitlement {
 				lastWasEntitlement = true
 				continue
 			}
-			if apiErr, ok := err.(*clineAPIError); ok && apiErr.statusCode == http.StatusTooManyRequests && apiErr.quota {
-				// 该账号此模型额度用尽：换下一个账号继续试当前模型
+			// 429 限流 / 402 余额不足：都是账号级问题 —— 402 冷却该账号上的
+			// 这个模型后换下一个账号继续试，不能换模型（其他账号可能还有额度）
+			if ok && (apiErr.statusCode == http.StatusTooManyRequests || apiErr.statusCode == http.StatusPaymentRequired) {
+				if apiErr.statusCode == http.StatusPaymentRequired {
+					setModelCooldown(acc, model, time.Now().Add(30*time.Minute))
+					log.Printf("  model %q on %s: insufficient credits (402), cooling for 30m, trying next account", model, acc.Email)
+				}
 				lastWas429 = true
 				continue
 			}
@@ -1532,15 +1746,19 @@ func callClineAPIWithAccountCtx(ctx context.Context, acc *Account, params map[st
 			}
 			return nil, acc, &clineAPIError{statusCode: resp.StatusCode, message: truncate(bodyStr, 500), entitlement: true}
 		}
-		// 429：只有响应写明该账号额度（Try again in）才做模型级冷却。
-		// 没有这段话的 429 不写号池，官方 Cline 客户端往往仍可直接请求。
+		// 429：模型级冷却 —— 只暂停该模型，账号保持可用，其他模型继续转发。
+		// 上游契约是「一律写冷却」：调用方据此换下一个候选账号，
+		// 不写冷却会让换号循环永远选到同一个账号（死循环）。
 		if resp.StatusCode == 429 {
 			model, _ := body["model"].(string)
-			if until, ok := parseQuotaCooldown(bodyStr); ok && model != "" {
+			until := parseCooldownUntil(bodyStr)
+			if model != "" {
 				setModelCooldown(acc, model, until)
-				return nil, acc, &clineAPIError{statusCode: resp.StatusCode, message: truncate(bodyStr, 500), quota: true}
+			} else {
+				acc.Status = "cooldown"
+				acc.CooldownUntil = until
+				savePool()
 			}
-			return nil, acc, &clineAPIError{statusCode: resp.StatusCode, message: truncate(bodyStr, 500)}
 		}
 		// 上游明确报「模型不存在」时清理下架残留（同步标记 Delisted 保留的模型）
 		if model, _ := body["model"].(string); model != "" && isModelGoneError(resp.StatusCode, bodyStr) {
@@ -1560,7 +1778,7 @@ func markAccountCooldown(acc *Account, until time.Time) {
 	poolMu.Lock()
 	acc.Status = "cooldown"
 	acc.CooldownUntil = until
-	savePoolLocked()
+	savePool()
 	poolMu.Unlock()
 }
 
@@ -1570,7 +1788,7 @@ func markAccountExpired(acc *Account) {
 	}
 	poolMu.Lock()
 	acc.Status = "expired"
-	savePoolLocked()
+	savePool()
 	poolMu.Unlock()
 }
 
@@ -1581,7 +1799,7 @@ func markAccountUsed(acc *Account) {
 	poolMu.Lock()
 	acc.LastUsed = time.Now()
 	acc.UsageCount++
-	savePoolLocked()
+	savePool()
 	poolMu.Unlock()
 }
 
@@ -1686,9 +1904,12 @@ func testAccount(acc *Account) accountTestResult {
 	result := accountTestResult{AccountID: acc.AccountID, Email: acc.Email}
 	started := time.Now()
 
+	// max_tokens 不能太小：推理模型（effort=high）会把预算全耗在 reasoning 上，
+	// 16 token 时上游必回「empty response content」500，账号测试与冷却恢复
+	// 频繁误报（issue #32）。1024 对连通性探针足够且成本可忽略。
 	params := map[string]any{
 		"model":      getDefaultModel(),
-		"max_tokens": 16,
+		"max_tokens": 1024,
 		"stream":     false,
 		"messages": []any{
 			map[string]any{"role": "user", "content": "hi"},
@@ -1893,7 +2114,7 @@ func modelCooldownActive(acc *Account, model string) bool {
 	}
 	if time.Now().After(until) {
 		delete(acc.ModelCooldowns, model)
-		savePoolLocked()
+		savePool()
 		return false
 	}
 	return true
@@ -2016,6 +2237,7 @@ func handleStreamResponse(w http.ResponseWriter, upstream *http.Response, acc *A
 					}
 				}
 				normalized := normalizeOpenAIResponse(obj)
+				restoreToolCallsInResponse(normalized, reqLog.toolNames)
 				if usage := parseTokenUsage(normalized["usage"]); usage.Valid {
 					latestUsage = mergeTokenUsage(latestUsage, usage)
 				}
@@ -2088,6 +2310,7 @@ func handleNonStreamResponse(w http.ResponseWriter, upstream *http.Response, acc
 	}
 
 	out = normalizeOpenAIResponse(out)
+	restoreToolCallsInResponse(out, reqLog.toolNames)
 	usage := parseTokenUsage(out["usage"])
 	recordTokenUsage(acc, reqLog.Model, usage)
 	finalizeRequestLog(reqLog, usage, time.Time{}, reqLog.StartedAt, true, "")
@@ -2137,9 +2360,13 @@ type anthropicReq struct {
 func loadOverrideContent() string {
 	data, err := os.ReadFile("override.md")
 	if err != nil {
-		log.Printf("  override.md not found: %v", err)
+		// 每个请求都会调用本函数；“文件不存在”只在首次打印一次，避免刷屏
+		if overrideMissLogged.CompareAndSwap(false, true) {
+			log.Printf("  override.md not found: %v", err)
+		}
 		return ""
 	}
+	overrideMissLogged.Store(false) // 文件出现了，重新允许日后删除时再提示一次
 	content := strings.TrimSpace(string(data))
 	if content != "" {
 		log.Printf("  using override.md as system prompt (%d bytes)", len(content))
@@ -2148,6 +2375,9 @@ func loadOverrideContent() string {
 	}
 	return content
 }
+
+// overrideMissLogged override.md 缺失日志的去重标记（详见 loadOverrideContent）。
+var overrideMissLogged atomic.Bool
 
 func extractStringContent(raw json.RawMessage) string {
 	if len(raw) == 0 {
@@ -2242,11 +2472,15 @@ func anthropicToOpenAI(req anthropicReq) map[string]any {
 
 	// System prompt: use override.md if it exists, otherwise use Anthropic's system field
 	sysContent := loadOverrideContent()
-	if sysContent == "" && req.System != nil {
-		sysContent = extractStringContent(req.System)
+	sysSource := "override.md"
+	if sysContent == "" {
+		sysSource = "client"
+		if req.System != nil {
+			sysContent = extractStringContent(req.System)
+		}
 	}
 	if sysContent != "" {
-		log.Printf("  system prompt: %d bytes (from override.md)", len(sysContent))
+		log.Printf("  system prompt: %d bytes (from %s)", len(sysContent), sysSource)
 		msgs = append(msgs, map[string]any{"role": "system", "content": sysContent})
 	}
 
@@ -2529,6 +2763,16 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 
 	reqLog := RequestLog{StartedAt: time.Now(), Protocol: "anthropic", Model: req.Model, Stream: req.Stream}
 
+	// 管理员手动停用的模型在入口直接拒绝（不进列表，也不可点名调用）
+	if req.Model != "" && isModelDisabled(req.Model) {
+		msg := fmt.Sprintf("model %q is disabled", req.Model)
+		finalizeRequestLog(&reqLog, tokenUsage{}, time.Time{}, reqLog.StartedAt, false, msg)
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": map[string]string{"message": msg, "type": "invalid_request_error"},
+		})
+		return
+	}
+
 	// 按 model 自动分流（与 chat 端点一致）：zen 免费/付费拒绝/Cline 池
 	switch routeModel(req.Model) {
 	case "off":
@@ -2554,6 +2798,8 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		}
 		resp, err := callZenAPI(openAIReq, req.Stream)
 		if err != nil {
+			// zen 故障转移到 Cline 池：先截短超长工具名（Meta 后端硬限 ≤64）
+			reqLog.toolNames = clampParamsToolNames(openAIReq)
 			if fbResp, fbAcc, fbErr, attempted := zenFailoverToCline(openAIReq, req.Stream); attempted {
 				if fbErr == nil {
 					log.Printf("  anthropic failover: serving %q via cline pool", req.Model)
@@ -2587,6 +2833,7 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 						usage := parseTokenUsage(out2["usage"])
 						recordTokenUsage(fbAcc, reqLog.Model, usage)
 						finalizeRequestLog(&reqLog, usage, time.Time{}, reqLog.StartedAt, true, "")
+						restoreToolCallsInResponse(out2, reqLog.toolNames)
 						anthropicResp := openAIToAnthropic(out2)
 						if hasToolUseBlocks(anthropicResp["content"]) {
 							anthropicResp["stop_reason"] = "tool_use"
@@ -2666,11 +2913,17 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Cline 通道：截短超长工具名并记录映射，回程由响应处理器还原（Meta 后端硬限 ≤64）
+	reqLog.toolNames = clampParamsToolNames(openAIReq)
 	resp, acc, err := callClineAPI(openAIReq, req.Stream)
 	if effectiveModel, ok := openAIReq["model"].(string); ok && effectiveModel != "" {
 		reqLog.Model = effectiveModel // 含回退后的实际服务模型
 	}
 	stampUpstream(&reqLog, openAIReq) // 归因实际服务方（provider / opencode / cline）
+	if acc != nil {
+		reqLog.AccountID = acc.AccountID
+		reqLog.AccountEmail = acc.Email // 失败也要记账号
+	}
 	if err != nil {
 		log.Printf("  anthropic api error: %v", err)
 		finalizeRequestLog(&reqLog, tokenUsage{}, time.Time{}, reqLog.StartedAt, false, err.Error())
@@ -2704,6 +2957,7 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		usage := parseTokenUsage(out["usage"])
 		recordTokenUsage(acc, reqLog.Model, usage)
 		finalizeRequestLog(&reqLog, usage, time.Time{}, reqLog.StartedAt, true, "")
+		restoreToolCallsInResponse(out, reqLog.toolNames)
 		anthropicResp := openAIToAnthropic(out)
 
 		if hasToolUseBlocks(anthropicResp["content"]) {
@@ -3097,6 +3351,8 @@ L:
 					obj = d
 				}
 			}
+			// 回程还原出站截短的工具名（Meta 后端硬限 ≤64 的映射）
+			restoreToolCallsInResponse(obj, reqLog.toolNames)
 			if usage := parseTokenUsage(obj["usage"]); usage.Valid {
 				latestUsage = mergeTokenUsage(latestUsage, usage)
 			}
@@ -3119,6 +3375,9 @@ L:
 				finalizeRequestLog(reqLog, latestUsage, firstOutputAt, reqLog.StartedAt, false, "upstream error: "+string(errBody))
 				return true
 			}
+
+			// 上游被截短的工具名还原为客户端原始名
+			restoreToolCallsInResponse(obj, reqLog.toolNames)
 
 			if !committed {
 				commit() // 首条有效数据行到达，提交响应头 + message_start

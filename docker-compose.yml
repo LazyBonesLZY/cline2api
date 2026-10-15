@@ -6,15 +6,16 @@ services:
     ports:
       - "3457:3457"
     volumes:
-      # 这些路径必须先是文件。不存在时 Docker 会建成目录，配置就写不进去。
-      - ./.cline-accounts.json:/app/.cline-accounts.json
-      - ./.cline-config.json:/app/.cline-config.json
-      - ./.cline-zen.json:/app/.cline-zen.json
-      - ./.cline-proxy.json:/app/.cline-proxy.json
-      - ./.cline-providers.json:/app/.cline-providers.json
-      - ./.cline-credentials.json:/app/.cline-credentials.json
-      - ./.cline-request-logs.json:/app/.cline-request-logs.json
+      # 数据目录整体挂载（账号/配置/用量统计等全部持久化），重建容器不丢数据
+      - ./data:/app/data
       - ./override.md:/app/override.md:ro
     environment:
       - PORT=3457
       - CLINE_PROXY_HOST=0.0.0.0
+      - CLINE2API_DATA_DIR=/app/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3457/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
