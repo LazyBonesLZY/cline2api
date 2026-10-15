@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -33,7 +34,7 @@ const (
 const tierCheckTTL = 24 * time.Hour
 
 // tierDetectWorkers 探测并发度。plan 接口很轻，适度并发可让 600 个号在 1 分钟内跑完。
-const tierDetectWorkers = 8
+const tierDetectWorkers = 4
 
 // clinePlanResponse GET /users/me/plan 的响应。
 type clinePlanResponse struct {
@@ -174,7 +175,7 @@ func fetchAccountPlan(acc *Account) (string, *clinePlanResponse, error) {
 		return tierUnknown, nil, fmt.Errorf("plan 404: %s", truncate(probe.Error, 80))
 	}
 	if resp.StatusCode != http.StatusOK {
-		return tierUnknown, nil, fmt.Errorf("plan status %d", resp.StatusCode)
+		return tierUnknown, nil, &planHTTPError{status: resp.StatusCode}
 	}
 
 	var out clinePlanResponse
@@ -192,14 +193,34 @@ func fetchAccountPlan(acc *Account) (string, *clinePlanResponse, error) {
 	return tierFree, &out, nil
 }
 
+// planHTTPError plan 接口的非 200 响应（429 可重试）。
+type planHTTPError struct{ status int }
+
+func (e *planHTTPError) Error() string { return fmt.Sprintf("plan status %d", e.status) }
+
+// planRetryWaits plan 接口遇 429 的退避等待序列。
+// 实测 600 个号并发探测会触发上游限流，退避重试能把大多数号测出来。
+var planRetryWaits = []time.Duration{2 * time.Second, 6 * time.Second, 15 * time.Second}
+
 // detectAccountTier 探测并写入单个账号的层级。
+// 遇 429 限流按 planRetryWaits 退避重试：限流不是层级信息，不能据此判 free/unknown。
 func detectAccountTier(acc *Account) (string, error) {
-	tier, plan, err := fetchAccountPlan(acc)
-	if err != nil {
-		return tierUnknown, err
+	var lastErr error
+	for attempt := 0; attempt <= len(planRetryWaits); attempt++ {
+		tier, plan, err := fetchAccountPlan(acc)
+		if err == nil {
+			applyPlanToAccount(acc, tier, plan)
+			return tier, nil
+		}
+		lastErr = err
+		var he *planHTTPError
+		if errors.As(err, &he) && he.status == http.StatusTooManyRequests && attempt < len(planRetryWaits) {
+			time.Sleep(planRetryWaits[attempt])
+			continue
+		}
+		break
 	}
-	applyPlanToAccount(acc, tier, plan)
-	return tier, nil
+	return tierUnknown, lastErr
 }
 
 // startTierDetect 异步批量探测：只探测「未探测过」或「已过 TTL」的账号。
