@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"log"
+	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -94,10 +96,19 @@ func setAccountTier(acc *Account, tier string) {
 	poolMu.Unlock()
 }
 
+// tierProbeInterval 两次探测之间的间隔。
+// 实测并发/连打过密会被上游以 429 限流（返回 HTML 429 页），大量账号因此测不出层级；
+// 拉开间隔虽然慢一些，但能拿到准确结果。
+const tierProbeInterval = 400 * time.Millisecond
+
+// tierProbeRetryWait 探测遇到 429 时的退避等待（重试一次）。
+const tierProbeRetryWait = 3 * time.Second
+
 // detectAccountTier 探测单个账号的层级。
 //   - 付费模型探测成功        → pass
 //   - 403 ENTITLEMENT        → free
-//   - 其它错误（网络/限流等） → 保持 unknown，不改判定（避免把好号误标成 free）
+//   - 429 限流               → 退避后重试一次（限流不代表层级）
+//   - 其它错误（网络等）      → 保持 unknown，不改判定（避免把好号误标成 free）
 func detectAccountTier(acc *Account) (string, error) {
 	model := tierProbeModel()
 	params := map[string]any{
@@ -108,19 +119,30 @@ func detectAccountTier(acc *Account) (string, error) {
 			map[string]any{"role": "user", "content": "hi"},
 		},
 	}
-	resp, _, err := callClineAPIWithAccountCtx(context.Background(), acc, params, false)
-	if err == nil {
-		if resp != nil && resp.Body != nil {
-			resp.Body.Close()
+
+	for attempt := 0; attempt < 2; attempt++ {
+		resp, _, err := callClineAPIWithAccountCtx(context.Background(), acc, params, false)
+		if err == nil {
+			if resp != nil && resp.Body != nil {
+				resp.Body.Close()
+			}
+			setAccountTier(acc, tierPass)
+			return tierPass, nil
 		}
-		setAccountTier(acc, tierPass)
-		return tierPass, nil
+		if apiErr, ok := err.(*clineAPIError); ok {
+			if apiErr.entitlement {
+				setAccountTier(acc, tierFree)
+				return tierFree, nil
+			}
+			// 429：限流不是层级信息，退避后重试一次
+			if apiErr.statusCode == http.StatusTooManyRequests && attempt == 0 {
+				time.Sleep(tierProbeRetryWait)
+				continue
+			}
+		}
+		return tierUnknown, err
 	}
-	if apiErr, ok := err.(*clineAPIError); ok && apiErr.entitlement {
-		setAccountTier(acc, tierFree)
-		return tierFree, nil
-	}
-	return tierUnknown, err
+	return tierUnknown, nil
 }
 
 // startTierDetect 异步批量探测：只探测「未探测过」或「已过 TTL」的账号。
@@ -154,6 +176,11 @@ func startTierDetect(force bool) bool {
 		}
 		poolMu.Unlock()
 
+		// 被显式指定过专供模型的账号优先探测：它们的层级直接决定付费模型能否工作。
+		sort.SliceStable(targets, func(i, j int) bool {
+			return len(targets[i].AssignedModels) > len(targets[j].AssignedModels)
+		})
+
 		tierDetectMu.Lock()
 		tierDetectState = struct {
 			Total     int       `json:"total"`
@@ -168,8 +195,12 @@ func startTierDetect(force bool) bool {
 
 		log.Printf("tier detect: probing %d account(s), probe model=%s", len(targets), tierProbeModel())
 
-		// 串行探测：并发打上游容易被限流，反而把好号误判成 unknown。
-		for _, acc := range targets {
+		// 串行探测 + 固定间隔：并发/连打过密会被上游 429 限流，
+		// 反而让大量账号测不出层级（unknown）。
+		for i, acc := range targets {
+			if i > 0 {
+				time.Sleep(tierProbeInterval)
+			}
 			tier, err := detectAccountTier(acc)
 			tierDetectMu.Lock()
 			tierDetectState.Done++
@@ -184,6 +215,10 @@ func startTierDetect(force bool) bool {
 			tierDetectMu.Unlock()
 			if err != nil && tier == tierUnknown {
 				log.Printf("tier detect: %s unknown (%v)", truncateEmail(acc.Email), err)
+			}
+			// 每 25 个落一次盘：探测可能持续很久，中途中断不至于全丢
+			if i%25 == 24 {
+				savePool()
 			}
 		}
 		savePool()
