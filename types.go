@@ -27,6 +27,15 @@ type Account struct {
 	// 用途：付费（cline-pass）账号只服务它订阅的付费模型，避免免费模型
 	// 把付费额度打光；也避免付费模型请求落在没有订阅的免费账号上（403 ENTITLEMENT）。
 	AssignedModels []string `json:"assignedModels,omitempty"`
+	// Tier 账号的订阅层级（自动探测，管理后台可看/可筛选）：
+	//   ""/"unknown" = 未探测
+	//   "free"       = 无 ClinePass 订阅（请求付费模型会 403 ENTITLEMENT）
+	//   "pass"       = 有 ClinePass 订阅（可服务 cline-pass/* 付费模型）
+	// 用途：付费模型只路由到 pass 账号，避免「拿 600 个免费号去撞付费模型」
+	// 那种每个号都吃一次 403 并被冷却的雪崩。
+	Tier string `json:"tier,omitempty"`
+	// TierCheckedAt 上次探测层级的时间（用于 TTL 与展示）。
+	TierCheckedAt time.Time `json:"tierCheckedAt,omitempty"`
 }
 
 type Model struct {

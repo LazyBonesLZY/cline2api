@@ -93,6 +93,8 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/models/delete", auth(handleAdminModelDelete))
 	mux.HandleFunc("/admin/api/models/context", auth(handleAdminModelContext))
 	mux.HandleFunc("/admin/api/accounts/models", auth(handleAdminAccountModels))
+	mux.HandleFunc("/admin/api/accounts/tier", auth(handleAdminAccountTier))
+	mux.HandleFunc("/admin/api/keys/update", auth(handleAdminKeyUpdate))
 	mux.HandleFunc("/admin/api/models/toggle", auth(handleAdminModelToggle))
 	mux.HandleFunc("/admin/api/config", auth(handleAdminConfig))
 	mux.HandleFunc("/admin/api/config/update", auth(handleAdminUpdateConfig))
@@ -1502,6 +1504,105 @@ func handleAdminAccountDedup(w http.ResponseWriter, r *http.Request) {
 			"remaining": remaining,
 		},
 	})
+}
+
+// GET/POST /admin/api/accounts/tier
+//
+//	GET  → 返回探测进度与各层级账号数
+//	POST → 启动批量探测（body: {force:true} 时忽略 TTL 全量重测）
+func handleAdminAccountTier(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "GET" {
+		writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
+			"progress": tierDetectStatus(),
+			"counts":   tierCounts(),
+			"probe":    tierProbeModel(),
+		}})
+		return
+	}
+	if r.Method != "POST" {
+		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: tAPI(r, "method_not_allowed")})
+		return
+	}
+	var req struct {
+		Force bool `json:"force"`
+	}
+	if r.Body != nil {
+		body, _ := io.ReadAll(r.Body)
+		if len(body) > 0 {
+			_ = json.Unmarshal(body, &req)
+		}
+	}
+	if !startTierDetect(req.Force) {
+		writeAPI(w, http.StatusOK, apiResponse{Success: false, Error: tAPI(r, "tier_detect_running")})
+		return
+	}
+	writeAPI(w, http.StatusOK, apiResponse{
+		Success: true,
+		Message: tAPI(r, "tier_detect_started"),
+		Data:    map[string]any{"progress": tierDetectStatus()},
+	})
+}
+
+// POST /admin/api/keys/update  body: { old, new }
+// 修改一个已有 API Key 的值（就地替换，保持顺序）；新值已存在或为空时拒绝。
+func handleAdminKeyUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: tAPI(r, "method_not_allowed")})
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: err.Error()})
+		return
+	}
+	defer r.Body.Close()
+
+	var req struct {
+		Old string `json:"old"`
+		New string `json:"new"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: tAPI(r, "invalid_json")})
+		return
+	}
+	req.Old = strings.TrimSpace(req.Old)
+	req.New = strings.TrimSpace(req.New)
+	if req.Old == "" || req.New == "" {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: tAPI(r, "key_value_required")})
+		return
+	}
+	if req.Old == req.New {
+		writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: tAPI(r, "key_updated")})
+		return
+	}
+
+	p := loadPool()
+	poolMu.Lock()
+	idx := -1
+	for i, k := range p.Keys {
+		if k == req.Old {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		poolMu.Unlock()
+		writeAPI(w, http.StatusNotFound, apiResponse{Error: tAPI(r, "key_not_found")})
+		return
+	}
+	for i, k := range p.Keys {
+		if k == req.New && i != idx {
+			poolMu.Unlock()
+			writeAPI(w, http.StatusConflict, apiResponse{Error: tAPI(r, "key_exists")})
+			return
+		}
+	}
+	p.Keys[idx] = req.New
+	poolMu.Unlock()
+	savePool()
+
+	log.Printf("admin: api key updated")
+	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: tAPI(r, "key_updated")})
 }
 
 // POST /admin/api/models/toggle  body: { ids: [...], disabled }

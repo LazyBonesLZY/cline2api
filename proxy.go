@@ -1744,6 +1744,10 @@ func callClineAPIWithAccountCtx(ctx context.Context, acc *Account, params map[st
 				log.Printf("  entitlement denied: account=%s model=%s (cooldown %v)",
 					truncateEmail(acc.Email), model, entitlementDenialTTL)
 			}
+			// 自我学习：该账号没有订阅，直接标记为 free，后续付费模型不再选它，
+			// 避免「拿整池免费号去撞付费模型」那种每个号吃一次 403 的雪崩。
+			// 订阅状态若之后变化，管理页可重新跑一次层级探测覆盖。
+			setAccountTier(acc, tierFree)
 			return nil, acc, &clineAPIError{statusCode: resp.StatusCode, message: truncate(bodyStr, 500), entitlement: true}
 		}
 		// 429：模型级冷却 —— 只暂停该模型，账号保持可用，其他模型继续转发。

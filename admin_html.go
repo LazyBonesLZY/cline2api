@@ -510,6 +510,7 @@ textarea{resize:vertical;min-height:88px;font-family:ui-monospace,'SF Mono','Cas
       <button class="btn btn-sm btn-danger" onclick="deleteSelectedAccounts(this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>删除选中<span id="delCount"></span></button>
       <button class="btn btn-sm" onclick="exportAccounts()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>导出全部</button>
       <button class="btn btn-primary btn-sm" onclick="switchTab('import')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>添加</button>
+      <button class="btn btn-sm" onclick="detectAccountTiers(this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>探测层级</button>
       <button class="btn btn-sm" onclick="dedupeAccounts(this)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M21 3l-7 7"/><path d="M8 21H3v-5"/><path d="M3 21l7-7"/></svg>去重</button>
       <button class="btn btn-sm" onclick="loadAccounts()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>刷新</button>
     </div>
@@ -1539,6 +1540,27 @@ const I18N = {
   ' 个账号': ' accounts left',
   '没有发现重复账号': 'No duplicate accounts found',
   '去重失败: ': 'Dedupe failed: ',
+  // 订阅层级
+  '探测层级': 'Detect Tiers',
+  '探测中...': 'Detecting...',
+  '有 ClinePass 订阅，可服务付费模型': 'Has ClinePass — can serve paid models',
+  '无订阅，请求付费模型会 403': 'No subscription — paid models return 403',
+  '尚未探测订阅层级': 'Tier not detected yet',
+  '已开始探测账号层级，可在账号列表查看结果': 'Tier detection started; results appear in the account list',
+  '探测已在进行中': 'Tier detection already running',
+  '探测失败: ': 'Detection failed: ',
+  '层级探测完成：PASS ': 'Tier detection done — PASS ',
+  ' · FREE ': ' · FREE ',
+  ' · 未探测 ': ' · unknown ',
+  // API Key 编辑
+  '编辑': 'Edit',
+  '修改密钥': 'Edit Key',
+  '新密钥值': 'New key value',
+  '密钥已更新': 'Key updated',
+  '密钥不存在': 'Key not found',
+  '该密钥已存在': 'Key already exists',
+  '密钥不能为空': 'Key must not be empty',
+  '更新失败: ': 'Update failed: ',
   // 模型管理（提供商分组 + 启停开关）
   '路由配置': 'Routing',
   '模型管理': 'Models',
@@ -1897,6 +1919,43 @@ function onAccSearch(v) {
   loadAccounts();
 }
 
+// 订阅层级徽标：pass 可服务付费模型 / free 请求付费模型必 403 / ? 待探测
+function tierBadgeHtml(tier) {
+  const v = (tier || '').toLowerCase();
+  if (v === 'pass') {
+    return '<span class="model-tag pass" style="font-size:10px;padding:1px 5px;margin-right:5px" title="' + t('有 ClinePass 订阅，可服务付费模型') + '">PASS</span>';
+  }
+  if (v === 'free') {
+    return '<span class="model-tag" style="font-size:10px;padding:1px 5px;margin-right:5px" title="' + t('无订阅，请求付费模型会 403') + '">FREE</span>';
+  }
+  return '<span class="model-tag" style="font-size:10px;padding:1px 5px;margin-right:5px;opacity:0.45" title="' + t('尚未探测订阅层级') + '">?</span>';
+}
+
+// 探测账号订阅层级（批量、后台异步执行）
+async function detectAccountTiers(btn) {
+  const orig = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="loading"></span> ' + t('探测中...'); }
+  try {
+    const d = await api('POST', '/accounts/tier', {});
+    if (d.success === false) { toast(d.error || t('探测已在进行中'), 'info'); }
+    else { toast(t('已开始探测账号层级，可在账号列表查看结果'), 'success'); }
+    for (let i = 0; i < 480; i++) {
+      await new Promise(r => setTimeout(r, 2500));
+      const s = await api('GET', '/accounts/tier');
+      const p = s.data.progress || {};
+      if (btn) btn.innerHTML = '<span class="loading"></span> ' + (p.done || 0) + '/' + (p.total || 0);
+      if (!p.running) {
+        const c = s.data.counts || {};
+        toast(t('层级探测完成：PASS ') + (c.pass || 0) + t(' · FREE ') + (c.free || 0) + t(' · 未探测 ') + (c.unknown || 0), 'success');
+        break;
+      }
+    }
+    await loadAccounts();
+    await loadStats();
+  } catch (e) { toast(t('探测失败: ') + e.message, 'error'); }
+  if (btn) { btn.disabled = false; btn.innerHTML = orig; }
+}
+
 async function loadAccounts() {
   try {
     const d = await api('GET', '/accounts');
@@ -1979,10 +2038,12 @@ async function loadAccounts() {
         ? ' <span class="model-tag pass" style="font-size:10px;padding:1px 6px" title="' + t('专供模型：') + esc(assigned.join(', ')) + '">' + t('专供') + ' ' + assigned.length + '</span>'
         : '';
       const selBox = '<input type="checkbox" ' + (_checkedAccounts.has(a.accountId) ? 'checked' : '') + ' onchange="onSelAccount(\'' + a.accountId + '\', this.checked)">';
+      // 订阅层级徽标：pass 可服务付费模型，free 请求付费模型必 403，unknown 待探测
+      const tierBadge = tierBadgeHtml(a.tier);
       return '<tr>' +
         '<td style="text-align:center">' + selBox + '</td>' +
         '<td class="mono" style="font-size:12px;color:var(--text3)">' + seq + '</td>' +
-        '<td class="mono" style="font-size:12px" title="' + esc(a.email) + '">' + esc(a.email) + assignedBadge + '</td>' +
+        '<td class="mono" style="font-size:12px" title="' + esc(a.email) + '">' + tierBadge + esc(a.email) + assignedBadge + '</td>' +
         '<td>' + statusBadge + '</td>' +
         '<td>' + formatNumber(a.usageCount) + '</td>' +
         '<td>' + formatTokenCount(a.promptTokens) + '</td>' +
@@ -2537,11 +2598,25 @@ async function loadKeys() {
     }
     el.innerHTML = keys.map(k =>
       '<div class="flex" style="margin-bottom:8px">' +
-        '<span class="key-display" style="flex:1" onclick="copyText(\'' + k + '\')" title="点击复制">' + esc(k) + '</span>' +
+        '<span class="key-display" style="flex:1" onclick="copyText(\'' + k + '\')" title="' + t('点击复制') + '">' + esc(k) + '</span>' +
+        '<button class="btn btn-sm" onclick="editKey(\'' + k + '\')" title="' + t('修改密钥') + '">✎</button>' +
         '<button class="btn btn-sm btn-danger" onclick="deleteKey(\'' + k + '\')">✕</button>' +
       '</div>'
     ).join('');
   } catch (e) { _('keysList').innerHTML = '<div class="empty">' + t('加载失败') + '</div>'; }
+}
+
+// 修改已有 API Key 的值（就地替换，保持顺序）
+async function editKey(oldKey) {
+  const next = prompt(t('新密钥值') + ':', oldKey);
+  if (next === null) return;
+  const v = next.trim();
+  if (!v) { toast(t('密钥不能为空'), 'error'); return; }
+  try {
+    await api('POST', '/keys/update', { old: oldKey, new: v });
+    toast(t('密钥已更新'), 'success');
+    loadKeys();
+  } catch (e) { toast(t('更新失败: ') + e.message, 'error'); }
 }
 
 async function generateKey() {

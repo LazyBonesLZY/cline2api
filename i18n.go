@@ -125,6 +125,30 @@ var apiMessages = map[string]map[locale]string{
 		localeZH: "已去重：删除 %d 条重复账号",
 		localeEN: "Deduped: removed %d duplicate accounts",
 	},
+	"tier_detect_started": {
+		localeZH: "已开始探测账号层级",
+		localeEN: "Tier detection started",
+	},
+	"tier_detect_running": {
+		localeZH: "层级探测正在进行中",
+		localeEN: "Tier detection already running",
+	},
+	"key_value_required": {
+		localeZH: "必须提供 old 与 new 密钥值",
+		localeEN: "both old and new key values are required",
+	},
+	"key_not_found": {
+		localeZH: "密钥不存在",
+		localeEN: "key not found",
+	},
+	"key_exists": {
+		localeZH: "该密钥已存在",
+		localeEN: "key already exists",
+	},
+	"key_updated": {
+		localeZH: "密钥已更新",
+		localeEN: "key updated",
+	},
 	"reset_failed": {
 		localeZH: "重置失败：%s",
 		localeEN: "reset failed: %s",

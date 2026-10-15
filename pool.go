@@ -790,13 +790,33 @@ func modelCandidatesLocked(p *AccountPool, model string) []*Account {
 	if owners := modelOwnersLocked(p, model); len(owners) > 0 {
 		return owners
 	}
+	// 付费模型只走「有订阅」或「尚未探测」的账号：已知 free 的账号请求付费模型
+	// 必然 403 ENTITLEMENT，让它进入候选只会白白吃一次 403 并被写冷却。
+	// 未探测的账号仍留在候选里，命中 403 后会自我降级为 free（池子自我学习）。
+	paid := isPaidModelLocked(p, model)
 	out := make([]*Account, 0, len(p.Accounts))
 	for _, a := range p.Accounts {
-		if len(a.AssignedModels) == 0 {
-			out = append(out, a)
+		if len(a.AssignedModels) > 0 {
+			continue // 被指定过的账号只服务它自己的列表
 		}
+		if paid && accountTier(a) == tierFree {
+			continue
+		}
+		out = append(out, a)
 	}
 	return out
+}
+
+// isPaidModelLocked 判断模型是否需要订阅：查池内模型目录。
+// 调用方已持有 poolMu，这里不能调用 getAllModels（它会再次取锁 → 死锁）。
+func isPaidModelLocked(p *AccountPool, model string) bool {
+	for _, m := range p.Models {
+		if m.ID == model {
+			return m.Cost != "free"
+		}
+	}
+	// 目录里没有（内置/未同步）：按前缀判断
+	return strings.HasPrefix(model, "cline-pass/")
 }
 
 // pickAccountForModelLeastUsed 在所有「模型未冷却」的候选账号中，选择该模型
@@ -1002,6 +1022,9 @@ func listAccounts() []*Account {
 		if len(a.AssignedModels) > 0 {
 			cp.AssignedModels = append([]string(nil), a.AssignedModels...)
 		}
+		// 订阅层级（自动探测结果，供后台分类/筛选）
+		cp.Tier = normalizeTier(a.Tier)
+		cp.TierCheckedAt = a.TierCheckedAt
 		result[i] = cp
 	}
 	return result
