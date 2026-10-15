@@ -119,35 +119,6 @@ func TestDedupeAccountsByEmailKeepsBestAndMergesStats(t *testing.T) {
 	}
 }
 
-// TestDedupeMergesAssignedModels 去重后专供模型取并集，避免路由行为变化。
-func TestDedupeMergesAssignedModels(t *testing.T) {
-	a := &Account{
-		AccountID: "acc_1", Email: "p@example.com", Status: "active", UsageCount: 5,
-		AssignedModels: []string{"model-x"},
-	}
-	b := &Account{
-		AccountID: "acc_2", Email: "P@example.com", Status: "active", UsageCount: 9,
-		AssignedModels: []string{"model-y", "model-x"},
-	}
-	setAccounts(t, a, b)
-
-	removed, _ := dedupeAccountsByEmail()
-	if removed != 1 {
-		t.Fatalf("removed = %d, want 1", removed)
-	}
-	got := loadPool().Accounts[0]
-	if got.AccountID != "acc_2" {
-		t.Fatalf("kept = %q, want acc_2 (higher usage)", got.AccountID)
-	}
-	// 并集：model-x 与 model-y 都要在
-	if len(got.AssignedModels) != 2 {
-		t.Fatalf("AssignedModels = %v, want a 2-model union", got.AssignedModels)
-	}
-	if !containsModel(got.AssignedModels, "model-x") || !containsModel(got.AssignedModels, "model-y") {
-		t.Fatalf("AssignedModels union wrong: %v", got.AssignedModels)
-	}
-}
-
 // TestDedupeMergesCooldowns 冷却取较晚的截止时间，避免去重后提前恢复。
 func TestDedupeMergesCooldowns(t *testing.T) {
 	early := time.Now().Add(time.Hour)

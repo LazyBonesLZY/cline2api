@@ -301,8 +301,14 @@ func TestCallClineAPIFreeRetriesNextGLMAccountAfterTransportFailure(t *testing.T
 	if got, want := strings.Join(models, ","), freeModelPrimary; got != want {
 		t.Fatalf("models = %q, want %q", got, want)
 	}
-	if first.Status != "cooldown" {
-		t.Fatalf("first account status = %q, want cooldown", first.Status)
+	// 契约变更（用户要求）：连接抖动只冷却「那个模型」，不整号冷却 ——
+	// 一个模型的问题不该把这号上其它模型一起停掉。
+	if first.Status != "active" {
+		t.Fatalf("first account status = %q, want active (transport failure must not cool the whole account)", first.Status)
+	}
+	if _, cooled := first.ModelCooldowns[freeModelPrimary]; !cooled {
+		t.Fatalf("first account should carry a model-level cooldown for %q, got %v",
+			freeModelPrimary, first.ModelCooldowns)
 	}
 }
 
@@ -1310,7 +1316,9 @@ func TestPickAccountForModelLeastUsedRotatesTies(t *testing.T) {
 	}
 }
 
-func TestCallClineAPIClientErrorDoesNotFallback(t *testing.T) {
+// 契约变更（用户要求）：上游 4xx 不再立刻透传，先把本地能试的（换号/换模型/
+// 故障转移）都试完，确实全部失败才把错误码返回给客户端。
+func TestCallClineAPIClientErrorRetriesLocallyThenReports(t *testing.T) {
 	oldPool := pool
 	oldConfig := getProxyConfig()
 	oldTransport := httpClient.Transport
@@ -1342,9 +1350,9 @@ func TestCallClineAPIClientErrorDoesNotFallback(t *testing.T) {
 
 	_, _, err := callClineAPI(map[string]any{"model": freeModelPrimary}, false)
 	if err == nil {
-		t.Fatal("expected client error")
+		t.Fatal("expected the client error to surface after local retries are exhausted")
 	}
-	if calls != 1 {
-		t.Fatalf("upstream calls = %d, want 1 (400 must not walk the fallback chain)", calls)
+	if calls < 2 {
+		t.Fatalf("upstream calls = %d, want >1 (a 400 must be retried locally before being reported)", calls)
 	}
 }

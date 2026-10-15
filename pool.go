@@ -500,16 +500,6 @@ func mergeAccountStats(keep, drop *Account) {
 			}
 		}
 	}
-	// 专供模型取并集：任一条指定过的模型都保留，避免去重后路由行为变化
-	if len(drop.AssignedModels) > 0 {
-		merged := append([]string(nil), keep.AssignedModels...)
-		for _, m := range drop.AssignedModels {
-			if !containsModel(merged, m) {
-				merged = append(merged, m)
-			}
-		}
-		keep.AssignedModels = merged
-	}
 }
 
 func removeAccount(accountID string) bool {
@@ -734,72 +724,22 @@ func pickFromAccountsLocked(p *AccountPool, list []*Account) *Account {
 	}
 }
 
-// normalizeAssignedModels 清洗模型指定列表：去空去重，保持用户输入顺序。
-func normalizeAssignedModels(models []string) []string {
-	if len(models) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(models))
-	seen := make(map[string]bool, len(models))
-	for _, m := range models {
-		m = strings.TrimSpace(m)
-		if m == "" || seen[m] {
-			continue
-		}
-		seen[m] = true
-		out = append(out, m)
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
-}
-
-func containsModel(list []string, model string) bool {
-	for _, m := range list {
-		if m == model {
-			return true
-		}
-	}
-	return false
-}
-
-// modelOwnersLocked 返回所有把该模型列为专属的账号（不论状态），
-// 用于稳定判定「这个模型是否已被指定」。
-func modelOwnersLocked(p *AccountPool, model string) []*Account {
-	var owners []*Account
-	for _, a := range p.Accounts {
-		if containsModel(a.AssignedModels, model) {
-			owners = append(owners, a)
-		}
-	}
-	return owners
-}
-
-// modelCandidatesLocked 返回可以服务该模型的账号候选集（调用方再按状态/冷却过滤）：
-//  1. 有账号把该模型列为专属（AssignedModels 含该模型）→ 只有这些账号服务它；
-//     这是付费模型的正确语义：没有订阅的账号请求它只会拿到 403 ENTITLEMENT；
-//  2. 该模型无人认领 → 只有「未指定任何模型」的账号参与，被指定过的账号
-//     只服务它自己的列表，避免付费额度被免费流量打光。
+// modelCandidatesLocked 返回可以服务该模型的账号候选集（调用方再按状态/冷却过滤）。
 //
-// 无任何指定配置时，候选集等于全部账号，行为与旧版本完全一致。
+// 付费模型只走「有订阅」或「尚未探测」的账号：已知 free 的账号请求付费模型
+// 必然 403 ENTITLEMENT，让它进入候选只会白白吃一次 403 并被写冷却。
+// 未探测的账号仍留在候选里，命中 403 后会自我降级为 free（池子自我学习）。
+// 免费模型不受层级限制，全部账号参与。
 func modelCandidatesLocked(p *AccountPool, model string) []*Account {
 	if model == "" {
 		return p.Accounts
 	}
-	if owners := modelOwnersLocked(p, model); len(owners) > 0 {
-		return owners
+	if !isPaidModelLocked(p, model) {
+		return p.Accounts
 	}
-	// 付费模型只走「有订阅」或「尚未探测」的账号：已知 free 的账号请求付费模型
-	// 必然 403 ENTITLEMENT，让它进入候选只会白白吃一次 403 并被写冷却。
-	// 未探测的账号仍留在候选里，命中 403 后会自我降级为 free（池子自我学习）。
-	paid := isPaidModelLocked(p, model)
 	out := make([]*Account, 0, len(p.Accounts))
 	for _, a := range p.Accounts {
-		if len(a.AssignedModels) > 0 {
-			continue // 被指定过的账号只服务它自己的列表
-		}
-		if paid && accountTier(a) == tierFree {
+		if accountTier(a) == tierFree {
 			continue
 		}
 		out = append(out, a)
@@ -817,6 +757,30 @@ func isPaidModelLocked(p *AccountPool, model string) bool {
 	}
 	// 目录里没有（内置/未同步）：按前缀判断
 	return strings.HasPrefix(model, "cline-pass/")
+}
+
+// isPaidModelForRequest 判断请求的模型是否需要订阅（自行取锁，供路由层使用）。
+func isPaidModelForRequest(model string) bool {
+	if model == "" {
+		return false
+	}
+	p := loadPool()
+	poolMu.Lock()
+	defer poolMu.Unlock()
+	return isPaidModelLocked(p, model)
+}
+
+// modelHasCandidate 判断该模型在层级维度上是否还有候选账号。
+// 付费模型在整池都是 free 账号时会返回 false —— 调用方据此给出
+// 「无人订阅」的明确错误，而不是退化成「全部冷却」的 429。
+func modelHasCandidate(model string) bool {
+	if model == "" {
+		return true
+	}
+	p := loadPool()
+	poolMu.Lock()
+	defer poolMu.Unlock()
+	return len(modelCandidatesLocked(p, model)) > 0
 }
 
 // pickAccountForModelLeastUsed 在所有「模型未冷却」的候选账号中，选择该模型
@@ -1018,13 +982,12 @@ func listAccounts() []*Account {
 				cp.ModelCooldowns[mid] = until
 			}
 		}
-		// 模型指定（脱敏拷贝，供后台展示与编辑）
-		if len(a.AssignedModels) > 0 {
-			cp.AssignedModels = append([]string(nil), a.AssignedModels...)
-		}
-		// 订阅层级（自动探测结果，供后台分类/筛选）
+		// 订阅层级与计划信息（自动探测结果，供后台分类/筛选）
 		cp.Tier = normalizeTier(a.Tier)
 		cp.TierCheckedAt = a.TierCheckedAt
+		cp.PlanName = a.PlanName
+		cp.PlanActive = a.PlanActive
+		cp.PlanPeriodEnd = a.PlanPeriodEnd
 		result[i] = cp
 	}
 	return result

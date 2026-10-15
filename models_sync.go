@@ -56,16 +56,16 @@ type modelSyncResult struct {
 }
 
 var (
-	modelSyncMu    sync.Mutex
-	lastModelSync  modelSyncResult
-	modelSyncRan   bool // 启动后是否已同步过（避免重复）
-	modelSyncBusy  bool // 同步进行中（防并发触发）
+	modelSyncMu   sync.Mutex
+	lastModelSync modelSyncResult
+	modelSyncRan  bool // 启动后是否已同步过（避免重复）
+	modelSyncBusy bool // 同步进行中（防并发触发）
 )
 
 // remoteModelsEnabled 远程同步成功后置 true：此后 getAllModels 以远程模型为主，
 // 内置硬编码模型（已失效）仅作为离线 fallback。
 var (
-	remoteModelsEnabled bool
+	remoteModelsEnabled   bool
 	remoteModelsEnabledMu sync.Mutex
 )
 

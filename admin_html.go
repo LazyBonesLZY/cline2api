@@ -519,6 +519,12 @@ textarea{resize:vertical;min-height:88px;font-family:ui-monospace,'SF Mono','Cas
     <div class="section-body flush">
       <div style="display:flex;gap:8px;align-items:center;padding:10px 16px;border-bottom:1px solid var(--border2)">
         <input type="text" id="accSearch" placeholder="搜索邮箱..." oninput="onAccSearch(this.value)" style="flex:1;max-width:320px;padding:7px 12px;border-radius:8px;border:1px solid var(--border2);background:var(--surface2);color:var(--text);font-size:13px">
+        <select id="accTierFilter" onchange="onAccTierFilter(this.value)" style="width:auto;padding:7px 12px;border-radius:8px;border:1px solid var(--border2);background:var(--surface2);color:var(--text);font-size:13px">
+          <option value="">全部层级</option>
+          <option value="pass">仅 PASS（可服务付费模型）</option>
+          <option value="free">仅 FREE（无订阅）</option>
+          <option value="unknown">仅未探测</option>
+        </select>
         <span id="accSearchCount" style="font-size:12px;color:var(--text3)"></span>
       </div>
       <table class="account-table">
@@ -1122,9 +1128,6 @@ textarea{resize:vertical;min-height:88px;font-family:ui-monospace,'SF Mono','Cas
   <div id="modelSyncModal" style="width:min(480px,calc(100vw - 40px));padding:24px;background:var(--surface);border-radius:14px;border:1px solid var(--border2);box-shadow:0 10px 40px rgba(15,23,42,0.2)"></div>
 </div>
 
-<div id="acctModelsOverlay" style="display:none;position:fixed;inset:0;z-index:9997;background:rgba(15,23,42,0.45);align-items:center;justify-content:center">
-  <div id="acctModelsModal" style="width:min(620px,calc(100vw - 32px));max-height:calc(100vh - 60px);display:flex;flex-direction:column;padding:24px;background:var(--surface);border-radius:14px;border:1px solid var(--border2);box-shadow:0 10px 40px rgba(15,23,42,0.2)"></div>
-</div>
 
 <script>
 
@@ -1521,17 +1524,8 @@ const I18N = {
   'Cline · 付费模型': 'Cline · Paid Models',
   '用户自定义': 'User Custom',
   '点击展开/折叠': 'Click to expand/collapse',
-  // 专供模型指定
-  '指定专供模型': 'Assign Models',
-  '专供': 'Assigned',
-  '专供模型：': 'Assigned models: ',
-  '当前指定': 'Currently assigned',
-  '解除指定': 'Clear assignment',
-  '未指定（参与所有模型的轮询）': 'Unassigned (participates in all models)',
-  '勾选后该账号只服务这些模型；被指定过的账号不再接手其它模型，避免付费额度被免费流量打光。全部取消勾选 = 恢复参与所有模型。': 'Once assigned, this account serves only these models; an assigned account stops taking other models, so paid quota is not drained by free traffic. Uncheck everything to restore full participation.',
   '已保存: ': 'Saved: ',
   ' 个模型': ' models',
-  '账号不存在': 'Account not found',
   // 账号去重
   '去重': 'Dedupe',
   '去重中...': 'Deduping...',
@@ -1546,6 +1540,10 @@ const I18N = {
   '有 ClinePass 订阅，可服务付费模型': 'Has ClinePass — can serve paid models',
   '无订阅，请求付费模型会 403': 'No subscription — paid models return 403',
   '尚未探测订阅层级': 'Tier not detected yet',
+  '全部层级': 'All tiers',
+  '仅 PASS（可服务付费模型）': 'PASS only (can serve paid models)',
+  '仅 FREE（无订阅）': 'FREE only (no subscription)',
+  '仅未探测': 'Undetected only',
   '已开始探测账号层级，可在账号列表查看结果': 'Tier detection started; results appear in the account list',
   '探测已在进行中': 'Tier detection already running',
   '探测失败: ': 'Detection failed: ',
@@ -1872,6 +1870,7 @@ const _accPageSize = 20;
 const _checkedAccounts = new Set();
 let _lastAccountList = []; // loadAccounts 缓存：全选本页/分页器复用，避免重复请求
 let _accSearch = ''; // 邮箱搜索词（不区分大小写）
+let _accTier = ''; // 订阅层级筛选：'' | 'pass' | 'free' | 'unknown'
 let _accSort = { key: null, dir: 1 }; // 列排序：key 见 _accSortValue，dir 1/-1
 
 function _accSortValue(a, key) {
@@ -1902,6 +1901,13 @@ function filteredAccountList() {
     const q = _accSearch.toLowerCase();
     list = list.filter(a => (a.email || '').toLowerCase().includes(q));
   }
+  // 订阅层级筛选：pass 可服务付费模型，free 请求付费模型必 403
+  if (_accTier) {
+    list = list.filter(a => {
+      const v = (a.tier || '').toLowerCase() || 'unknown';
+      return v === _accTier;
+    });
+  }
   if (_accSort.key) {
     const key = _accSort.key, dir = _accSort.dir;
     list = list.slice().sort((a, b) => {
@@ -1915,6 +1921,12 @@ function filteredAccountList() {
 
 function onAccSearch(v) {
   _accSearch = v.trim();
+  _accPage = 1;
+  loadAccounts();
+}
+
+function onAccTierFilter(v) {
+  _accTier = (v || '').trim().toLowerCase();
   _accPage = 1;
   loadAccounts();
 }
@@ -1965,7 +1977,10 @@ async function loadAccounts() {
     const tbody = _('accountTableBody');
     const cards = _('accountCards');
     const sc = _('accSearchCount');
-    if (sc) sc.textContent = _accSearch ? (t('匹配') + ' ' + view.length + ' / ' + (_lastAccountList.length || 0)) : '';
+    if (sc) {
+      const filtering = _accSearch || _accTier;
+      sc.textContent = filtering ? (t('匹配') + ' ' + view.length + ' / ' + (_lastAccountList.length || 0)) : '';
+    }
     // 勾选状态跟随列表清理（已删除的账号从勾选中移除）
     if (list) {
       const ids = new Set(list.map(a => a.accountId));
@@ -2032,18 +2047,13 @@ async function loadAccounts() {
         : '<span class="status ' + a.status + '"><span class="status-dot ' + a.status + '"></span>' + (sn[a.status] || a.status) + '</span>';
       // 始终显示模型统计展开按钮（无数据时子行提示暂无）
       const expander = '<button class="btn btn-sm btn-icon" onclick="toggleModelRow(\'' + a.accountId + '\', this)" title="' + t('展开') + '">▸</button>';
-      // 已指定的专供模型标记：付费账号一眼看出归属
-      const assigned = (a.assignedModels || []);
-      const assignedBadge = assigned.length
-        ? ' <span class="model-tag pass" style="font-size:10px;padding:1px 6px" title="' + t('专供模型：') + esc(assigned.join(', ')) + '">' + t('专供') + ' ' + assigned.length + '</span>'
-        : '';
       const selBox = '<input type="checkbox" ' + (_checkedAccounts.has(a.accountId) ? 'checked' : '') + ' onchange="onSelAccount(\'' + a.accountId + '\', this.checked)">';
       // 订阅层级徽标：pass 可服务付费模型，free 请求付费模型必 403，unknown 待探测
       const tierBadge = tierBadgeHtml(a.tier);
       return '<tr>' +
         '<td style="text-align:center">' + selBox + '</td>' +
         '<td class="mono" style="font-size:12px;color:var(--text3)">' + seq + '</td>' +
-        '<td class="mono" style="font-size:12px" title="' + esc(a.email) + '">' + tierBadge + esc(a.email) + assignedBadge + '</td>' +
+        '<td class="mono" style="font-size:12px" title="' + esc(a.email) + '">' + tierBadge + esc(a.email) + '</td>' +
         '<td>' + statusBadge + '</td>' +
         '<td>' + formatNumber(a.usageCount) + '</td>' +
         '<td>' + formatTokenCount(a.promptTokens) + '</td>' +
@@ -2053,7 +2063,6 @@ async function loadAccounts() {
         '<td>' + fmtDateTime2(a.lastUsed) + '</td>' +
         '<td>' + fmtDateTime2(a.createdAt) + '</td>' +
         '<td style="white-space:nowrap">' + expander +
-          '<button class="btn btn-sm" onclick="openModelAssign(\'' + a.accountId + '\')" title="' + t('指定专供模型') + '">🎯</button> ' +
           '<button class="btn btn-sm" onclick="testAccount(\'' + a.accountId + '\',this)" title="测试">⚡</button> ' +
           '<button class="btn btn-sm" onclick="resetAccount(\'' + a.accountId + '\')" title="重置">↻</button> ' +
           '<button class="btn btn-sm btn-danger" onclick="deleteAccount(\'' + a.accountId + '\')" title="删除">✕</button>' +
@@ -2098,256 +2107,12 @@ async function loadAccounts() {
           '<div class="account-metric"><span class="account-metric-label">' + t('输出') + '</span><span class="account-metric-value">' + formatTokenCount(a.completionTokens) + '</span></div>' +
         '</div>' + modelHtml +
         '<div class="account-card-footer"><span>' + t('最后使用：') + lu + '</span><span class="account-card-actions">' +
-          '<button class="btn btn-sm" onclick="openModelAssign(\'' + a.accountId + '\')" title="' + t('指定专供模型') + '">🎯</button>' +
           '<button class="btn btn-sm" onclick="testAccount(\'' + a.accountId + '\',this)" title="测试">⚡</button>' +
           '<button class="btn btn-sm" onclick="resetAccount(\'' + a.accountId + '\')" title="重置">↻</button>' +
           '<button class="btn btn-sm btn-danger" onclick="deleteAccount(\'' + a.accountId + '\')" title="删除">✕</button>' +
         '</span></div></article>';
     }).join('');
   } catch (e) { toast(t('加载账号失败: ') + e.message, 'error'); }
-}
-
-// ========== 指定专供模型 ==========
-// 付费（cline-pass）账号只服务它订阅的模型，避免免费流量打光付费额度，
-// 也避免付费模型请求落到未订阅的账号上（403 ENTITLEMENT_ERROR）。
-let _assignModels = [];       // 当前可勾选的模型（Cline 侧）
-let _assignSelected = [];     // 当前账号已选中/已指定的模型 ID
-let _assignAccountId = '';
-let _assignAccountEmail = '';
-
-async function openModelAssign(accountId) {
-  const d = await api('GET', '/accounts');
-  const acc = (d.data.accounts || []).find(a => a.accountId === accountId);
-  if (!acc) { toast(t('账号不存在'), 'error'); return; }
-  _assignAccountId = accountId;
-  _assignAccountEmail = acc.email || '';
-  _assignSelected = (acc.assignedModels || []).slice();
-
-  if (!_cachedModels || !_cachedModels.length) await loadModels();
-  // 只列出 Cline 侧模型：zen 免费模型不占用 Cline 账号额度，无需指定
-  _assignModels = (_cachedModels || []).filter(m => !isOcModel(m));
-
-  renderModelAssign();
-  _('acctModelsOverlay').style.display = 'flex';
-}
-
-function renderModelAssign() {
-  const sel = new Set(_assignSelected);
-  // 索引唯一定位复选框，避免把模型 ID 拼进 inline handler 的引号里
-  const idxOf = new Map(_assignModels.map((m, i) => [m.id, i]));
-  const groups = [
-    { label: 'Cline · 付费模型', items: _assignModels.filter(m => m.cost !== 'free') },
-    { label: 'Cline · 免费模型', items: _assignModels.filter(m => m.cost === 'free') },
-  ];
-  const listHtml = groups.map(g => {
-    if (!g.items.length) return '';
-    const rows = g.items.map(m => {
-      const on = sel.has(m.id);
-      const bg = on ? 'var(--accent-soft)' : 'transparent';
-      return '<label style="display:flex;align-items:center;gap:9px;padding:7px 10px;border-radius:8px;cursor:pointer;background:' + bg + '">' +
-        '<input type="checkbox" style="width:auto;margin:0" ' + (on ? 'checked' : '') +
-          ' data-assign-idx="' + idxOf.get(m.id) + '">' +
-        '<span class="mono" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(m.id) + '</span>' +
-        '<span class="model-tag ' + (m.cost || 'free') + '" style="margin:0;font-size:10px;padding:1px 6px">' + (m.cost || 'free') + '</span>' +
-      '</label>';
-    }).join('');
-    return '<div style="margin-bottom:12px"><div style="font-size:12px;font-weight:600;color:var(--text2);margin-bottom:6px">' +
-      t(g.label) + ' · ' + g.items.length + '</div>' + rows + '</div>';
-  }).join('') || '<div class="empty">' + t('暂无模型') + '</div>';
-
-  const selectedChips = _assignSelected.length
-    ? _assignSelected.map(id => '<span class="model-tag pass" style="margin:2px">' + esc(id) + '</span>').join('')
-    : '<span style="color:var(--text3);font-size:12px">' + t('未指定（参与所有模型的轮询）') + '</span>';
-
-  _('acctModelsModal').innerHTML =
-    '<h2 style="margin:0 0 4px;font-size:18px">' + t('指定专供模型') + '</h2>' +
-    '<div class="mono" style="font-size:12px;color:var(--text2);margin-bottom:12px">' + esc(_assignAccountEmail) + '</div>' +
-    '<div class="section-desc" style="padding:0 0 12px">' +
-      t('勾选后该账号只服务这些模型；被指定过的账号不再接手其它模型，避免付费额度被免费流量打光。全部取消勾选 = 恢复参与所有模型。') +
-    '</div>' +
-    '<div style="padding:10px;border-radius:8px;background:var(--surface2);border:1px solid var(--border2);margin-bottom:12px;max-height:96px;overflow-y:auto">' +
-      '<div style="font-size:11px;font-weight:600;color:var(--text2);margin-bottom:6px">' + t('当前指定') + ' (' + _assignSelected.length + ')</div>' + selectedChips + '</div>' +
-    '<div id="assignModelList" style="flex:1;overflow-y:auto;padding-right:4px;min-height:120px">' + listHtml + '</div>' +
-    '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;border-top:1px solid var(--border2);padding-top:14px">' +
-      '<button class="btn" onclick="clearModelAssign()">' + t('解除指定') + '</button>' +
-      '<button class="btn" onclick="closeModelAssign()">' + t('取消') + '</button>' +
-      '<button class="btn btn-primary" onclick="saveModelAssign()">' + t('保存') + '</button>' +
-    '</div>';
-
-  // 勾选状态变化时同步「当前指定」区（事件委派，无 inline handler）
-  const list = _('assignModelList');
-  if (list) {
-    list.onchange = e => {
-      const box = e.target;
-      const idx = parseInt(box.dataset.assignIdx, 10);
-      const m = _assignModels[idx];
-      if (!m) return;
-      const next = new Set(_assignSelected);
-      if (box.checked) next.add(m.id); else next.delete(m.id);
-      _assignSelected = Array.from(next);
-      renderModelAssign();
-    };
-  }
-}
-
-function clearModelAssign() {
-  _assignSelected = [];
-  renderModelAssign();
-}
-
-function closeModelAssign() {
-  _('acctModelsOverlay').style.display = 'none';
-}
-
-async function saveModelAssign() {
-  try {
-    await api('POST', '/accounts/models', { accountId: _assignAccountId, models: _assignSelected });
-    toast(t('已保存: ') + _assignSelected.length + t(' 个模型'), 'success');
-    closeModelAssign();
-    loadAccounts();
-  } catch (e) { toast(t('保存失败: ') + e.message, 'error'); }
-}
-// 分页器：页码按钮 + 总数（total 为缓存列表长度）
-function renderAccountPager(total) {
-  const pager = _('accountPager');
-  if (!pager) return;
-  const totalPages = Math.max(1, Math.ceil(total / _accPageSize));
-  if (totalPages <= 1 && total <= _accPageSize) { pager.style.display = 'none'; return; }
-  pager.style.display = 'flex';
-  pager.innerHTML =
-    '<span style="font-size:12px;color:var(--text2)">' + t('共') + ' ' + total + ' ' + t('个账号 · 每页') + ' ' + _accPageSize + '</span>' +
-    '<div style="display:flex;gap:6px;align-items:center">' +
-      '<button class="btn btn-sm" ' + (_accPage <= 1 ? 'disabled' : '') + ' onclick="accGotoPage(' + (_accPage - 1) + ')">‹</button>' +
-      '<span style="font-size:12px" class="mono">' + _accPage + ' / ' + totalPages + '</span>' +
-      '<button class="btn btn-sm" ' + (_accPage >= totalPages ? 'disabled' : '') + ' onclick="accGotoPage(' + (_accPage + 1) + ')">›</button>' +
-    '</div>';
-}
-
-function accGotoPage(p) {
-  _accPage = p;
-  loadAccounts();
-}
-
-// 勾选单个账号（跨页保持）
-function onSelAccount(id, checked) {
-  if (checked) _checkedAccounts.add(id);
-  else _checkedAccounts.delete(id);
-  updateSelCount();
-}
-
-// 全选/全不选当前页：优先用缓存列表；缓存为空（刚删除/导出后尚未刷新）时
-// 退回当前渲染行上的勾选框（从 onchange="onSelAccount('id',...)" 解析账号 ID）。
-function toggleAllAccountSel(box) {
-  const list = filteredAccountList();
-  const totalPages = Math.max(1, Math.ceil(list.length / _accPageSize));
-  const p = Math.min(_accPage, totalPages);
-  const chunk = list.slice((p - 1) * _accPageSize, p * _accPageSize);
-  if (chunk.length) {
-    chunk.forEach(a => {
-      if (box.checked) _checkedAccounts.add(a.accountId);
-      else _checkedAccounts.delete(a.accountId);
-    });
-    updateSelCount();
-    loadAccounts();
-    return;
-  }
-  const boxes = document.querySelectorAll('#accountTableBody input[type="checkbox"][onchange*="onSelAccount"]');
-  if (!boxes.length) { loadAccounts(); return; }
-  boxes.forEach(cb => {
-    const m = (cb.getAttribute('onchange') || '').match(/onSelAccount\('([^']+)'/);
-    if (!m) return;
-    cb.checked = box.checked;
-    if (box.checked) _checkedAccounts.add(m[1]);
-    else _checkedAccounts.delete(m[1]);
-  });
-  updateSelCount();
-}
-
-// 勾选计数徽标：同时根据当前页是否全部勾选来同步“全选”框，避免勾上后被强制重置
-function updateSelCount() {
-  const n = _checkedAccounts.size;
-  const sel = _('selCount'), del = _('delCount'), reset = _('resetCount'), all = _('accSelAll');
-  if (sel) sel.textContent = n ? ' (' + n + ')' : '';
-  if (del) del.textContent = n ? ' (' + n + ')' : '';
-  if (reset) reset.textContent = n ? ' (' + n + ')' : '';
-  if (all) {
-    const list = filteredAccountList();
-    const totalPages = Math.max(1, Math.ceil(list.length / _accPageSize));
-    const p = Math.min(_accPage, totalPages);
-    const chunk = list.slice((p - 1) * _accPageSize, p * _accPageSize);
-    all.checked = chunk.length > 0 && chunk.every(a => _checkedAccounts.has(a.accountId));
-  }
-}
-
-// 导出勾选的账号（POST /accounts/export {ids}，未勾选时提示）
-async function exportSelectedAccounts() {
-  const ids = [..._checkedAccounts];
-  if (!ids.length) { toast(t('请先勾选要导出的账号'), 'info'); return; }
-  try {
-    const res = await fetch(API + '/accounts/export', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ids: ids })
-    });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'cline-accounts-export.json';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    toast(t('已导出 ') + ids.length + t(' 个账号'), 'success');
-  } catch (e) { toast(t('导出失败: ') + e.message, 'error'); }
-}
-
-// 删除勾选的账号（逐个调用现有删除接口，带确认）
-// 重置勾选的账号（逐个调用现有重置接口，清除冷却/失败计数）
-async function resetSelectedAccounts(btn) {
-  const ids = [..._checkedAccounts];
-  if (!ids.length) { toast(t('请先勾选要重置的账号'), 'info'); return; }
-  if (!confirm(t('确认重置选中的 ') + ids.length + t(' 个账号？（清除冷却与失败计数）'))) return;
-  const orig = btn ? btn.innerHTML : '';
-  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="loading"></span> ' + t('重置中...'); }
-  let ok = 0, fail = 0;
-  for (const id of ids) {
-    try { await api('POST', '/accounts/reset', { accountId: id }); ok++; }
-    catch (e) { fail++; }
-  }
-  _checkedAccounts.clear();
-  if (btn) { btn.disabled = false; btn.innerHTML = orig; }
-  if (fail) toast(t('已重置 ') + ok + t(' 个，失败 ') + fail + t(' 个'), 'error');
-  else toast(t('已重置 ') + ok + t(' 个账号'), 'success');
-  await loadAccounts();
-}
-
-async function deleteSelectedAccounts(btn) {
-  const ids = [..._checkedAccounts];
-  if (!ids.length) { toast(t('请先勾选要删除的账号'), 'info'); return; }
-  if (!confirm(t('确认删除选中的 ') + ids.length + t(' 个账号？此操作不可恢复'))) return;
-  const orig = btn ? btn.innerHTML : '';
-  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="loading"></span> ' + t('删除中...'); }
-  let ok = 0, fail = 0;
-  for (const id of ids) {
-    try { await api('POST', '/accounts/delete', { accountId: id }); ok++; }
-    catch (e) { fail++; }
-  }
-  _checkedAccounts.clear();
-  if (btn) { btn.disabled = false; btn.innerHTML = orig; }
-  if (fail) toast(t('已删除 ') + ok + t(' 个，失败 ') + fail + t(' 个失败'), 'error');
-  else toast(t('已删除 ') + ok + t(' 个账号'), 'success');
-  await loadAccounts();
-  await loadStats();
-}
-
-// 表格时间列：日期一行、时间灰色小字一行，固定不折行
-function fmtDateTime2(v) {
-  if (!v) return '<span style="color:var(--text3)">-</span>';
-  const d = new Date(v);
-  return '<div style="white-space:nowrap">' + d.toLocaleDateString(LC()) + '</div>' +
-    '<div style="white-space:nowrap;font-size:10px;color:var(--text3)">' + d.toLocaleTimeString(LC()) + '</div>';
 }
 
 // 展开/收起账号的模型统计子行（表格视图）

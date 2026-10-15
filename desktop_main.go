@@ -104,7 +104,7 @@ func runDesktopWindow(port int) error {
 			Handler: desktopRedirectHandler(port),
 		},
 		BackgroundColour: &options.RGBA{R: 248, G: 250, B: 252, A: 255},
-		OnStartup:       func(_ context.Context) {},
+		OnStartup:        func(_ context.Context) {},
 		Windows: &windows.Options{
 			WebviewIsTransparent: false,
 			WindowIsTranslucent:  false,

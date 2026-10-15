@@ -21,21 +21,21 @@ type Account struct {
 	ModelStats map[string]*ModelStat `json:"modelStats,omitempty"`
 	// ModelCooldowns 模型级冷却：modelID → 恢复时间（429 时记录，只暂停该模型）
 	ModelCooldowns map[string]time.Time `json:"modelCooldowns,omitempty"`
-	// AssignedModels 该账号「专供」的模型列表（管理后台指定）。
-	// 空 = 不限制，参与所有模型的轮询（默认行为，向后兼容）；
-	// 非空 = 只有列表内的模型才会选中这个账号。
-	// 用途：付费（cline-pass）账号只服务它订阅的付费模型，避免免费模型
-	// 把付费额度打光；也避免付费模型请求落在没有订阅的免费账号上（403 ENTITLEMENT）。
-	AssignedModels []string `json:"assignedModels,omitempty"`
-	// Tier 账号的订阅层级（自动探测，管理后台可看/可筛选）：
+	// Tier 账号的订阅层级（来自 GET /users/me/plan 自动探测）：
 	//   ""/"unknown" = 未探测
-	//   "free"       = 无 ClinePass 订阅（请求付费模型会 403 ENTITLEMENT）
-	//   "pass"       = 有 ClinePass 订阅（可服务 cline-pass/* 付费模型）
-	// 用途：付费模型只路由到 pass 账号，避免「拿 600 个免费号去撞付费模型」
+	//   "free"       = 无 Cline Pass 计划（付费模型会 403 ENTITLEMENT）
+	//   "pass"       = 有 Cline Pass 且启用中（可服务 cline-pass/* 付费模型）
+	// 用途：付费模型只路由到 pass 账号，避免「拿整池免费号去撞付费模型」
 	// 那种每个号都吃一次 403 并被冷却的雪崩。
 	Tier string `json:"tier,omitempty"`
 	// TierCheckedAt 上次探测层级的时间（用于 TTL 与展示）。
 	TierCheckedAt time.Time `json:"tierCheckedAt,omitempty"`
+	// PlanName 订阅计划名（如 "Cline Pass (Monthly)"），无计划时为空。
+	PlanName string `json:"planName,omitempty"`
+	// PlanActive 计划是否处于启用状态。
+	PlanActive bool `json:"planActive,omitempty"`
+	// PlanPeriodEnd 当前计费周期结束时间（订阅到期/续费点）。
+	PlanPeriodEnd time.Time `json:"planPeriodEnd,omitempty"`
 }
 
 type Model struct {

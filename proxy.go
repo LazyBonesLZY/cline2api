@@ -1134,10 +1134,6 @@ func clineHeaders(token, sessionID string) http.Header {
 type clineAPIError struct {
 	statusCode int
 	message    string
-	// quota 为真表示这是该账号在该模型上的额度冷却（响应里有 Try again in）。
-	// 普通 429（网关、出口 IP、瞬时限流）不能当成账号额度，否则一次请求会把整池写上冷却，
-	// 而官方 Cline 客户端用同一批号仍然能请求。
-	quota bool
 	// entitlement 为真表示该账号未订阅此模型（403 ENTITLEMENT_ERROR）。
 	// 处理方式与 quota 一致：换下一个账号/模型，而不是把 403 当成请求错误透传。
 	entitlement bool
@@ -1288,6 +1284,10 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 	// entitlementExhausted 记录「该模型的候选账号全部因未订阅而被拒」：
 	// 这种请求的正确答案是 403 + 处置建议，而不是 500/429。
 	entitlementExhausted := make(map[string]bool)
+	// lastClientErr 记录链上最后一次「上游 4xx」错误。
+	// 4xx 不再立刻透传：先把本地能试的（换号/换模型/provider/故障转移）都试完，
+	// 确实全部失败才把错误码返回给客户端。
+	var lastClientErr error
 	for _, m := range chain {
 		// 先试自定义 provider
 		if pResp, pErr, attempted := callCustomProviderAPI(withModel(params, m), stream); attempted {
@@ -1344,9 +1344,11 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 				log.Printf("  model %q on %s: insufficient credits (402), cooling for 30m, trying next account", m, usedAcc.Email)
 				continue
 			}
-			// 4xx（除 402/429）是请求本身的问题：换模型只会把参数错误伪装成另一个模型的成功。
+			// 4xx（除 402/403/429）：记录后继续尝试链上下一个模型。
+			// 全部候选都失败才把错误码返回（用户要求：先本地重试/换号完再报错）。
 			if ok && isUpstreamClientError(apiErr.statusCode) {
-				return nil, usedAcc, err
+				lastClientErr = err
+				break
 			}
 			if !ok || apiErr.statusCode != http.StatusTooManyRequests {
 				// 非 429 错误：若后面还有候选（provider / 链）则继续降级，否则透传
@@ -1359,6 +1361,12 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 			break
 		}
 		// 试遍了候选账号且全部被拒 → 该模型在本池中无人订阅
+		// 一次都没试成（候选集为空）且该模型是付费模型 → 池里没有任何号订阅它。
+		// 直接判定为「无人订阅」，而不是退化成「全部冷却」的 429 —— 后者对客户端
+		// 毫无指导意义（客户端会以为重试就好，实际永远不可能成功）。
+		if attempted == 0 && isPaidModelForRequest(m) && !modelHasCandidate(m) {
+			entitlementExhausted[m] = true
+		}
 		if attempted > 0 && denied == attempted {
 			entitlementExhausted[m] = true
 		}
@@ -1393,6 +1401,10 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 	// 并指出处置方式，而不是伪装成 500 或限流。
 	if entitlementExhausted[model] {
 		return nil, nil, &modelEntitlementError{model: model}
+	}
+	// 本地全部候选都试过了，仍只有 4xx：此时才把上游错误码透传给客户端
+	if lastClientErr != nil {
+		return nil, nil, lastClientErr
 	}
 	if hasActiveAccounts() {
 		return nil, nil, &freeModelUnavailableError{message: fmt.Sprintf("model %q is cooling on all accounts and no fallback model is available", model)}
@@ -1703,7 +1715,9 @@ func callClineAPIWithAccountCtx(ctx context.Context, acc *Account, params map[st
 
 	resp, err := doUpstream(req, stream)
 	if err != nil {
-		markAccountCooldown(acc, time.Now().Add(5*time.Minute))
+		// 只冷却「这个模型」而不是整个账号：连接抖动不该把这号上其它模型一起停掉。
+		// 调用方收到 clineAccountUnavailableError 会在本次请求内换下一个账号。
+		coolModelShort(acc, params, time.Now().Add(2*time.Minute))
 		return nil, acc, &clineAccountUnavailableError{err: fmt.Errorf("upstream request: %w", err)}
 	}
 
@@ -1718,7 +1732,7 @@ func callClineAPIWithAccountCtx(ctx context.Context, acc *Account, params map[st
 			req.Body = io.NopCloser(bytes.NewReader(bodyJSON))
 			resp, err = doUpstream(req, stream)
 			if err != nil {
-				markAccountCooldown(acc, time.Now().Add(5*time.Minute))
+				coolModelShort(acc, params, time.Now().Add(2*time.Minute))
 				return nil, acc, &clineAccountUnavailableError{err: fmt.Errorf("upstream retry: %w", err)}
 			}
 			if resp.StatusCode == 401 {
@@ -1744,24 +1758,24 @@ func callClineAPIWithAccountCtx(ctx context.Context, acc *Account, params map[st
 				log.Printf("  entitlement denied: account=%s model=%s (cooldown %v)",
 					truncateEmail(acc.Email), model, entitlementDenialTTL)
 			}
-			// 自我学习：该账号没有订阅，直接标记为 free，后续付费模型不再选它，
-			// 避免「拿整池免费号去撞付费模型」那种每个号吃一次 403 的雪崩。
-			// 订阅状态若之后变化，管理页可重新跑一次层级探测覆盖。
-			setAccountTier(acc, tierFree)
+			// 自我学习：仅在层级未知时降级为 free。已经探测确认过 pass 的账号
+			// 若某个模型 403，那是「该模型不在其计划内」，不该推翻整体层级判定。
+			if accountTier(acc) == tierUnknown {
+				setAccountTier(acc, tierFree)
+			}
 			return nil, acc, &clineAPIError{statusCode: resp.StatusCode, message: truncate(bodyStr, 500), entitlement: true}
 		}
-		// 429：模型级冷却 —— 只暂停该模型，账号保持可用，其他模型继续转发。
+		// 429：只冷却「这个账号的这个模型」，绝不整号冷却。
+		// 整号冷却会让一个模型的问题把这号上其它模型一起停掉（用户明确要求避免）。
 		// 上游契约是「一律写冷却」：调用方据此换下一个候选账号，
 		// 不写冷却会让换号循环永远选到同一个账号（死循环）。
 		if resp.StatusCode == 429 {
 			model, _ := body["model"].(string)
-			until := parseCooldownUntil(bodyStr)
+			if model == "" {
+				model, _ = params["model"].(string)
+			}
 			if model != "" {
-				setModelCooldown(acc, model, until)
-			} else {
-				acc.Status = "cooldown"
-				acc.CooldownUntil = until
-				savePool()
+				setModelCooldown(acc, model, parseCooldownUntil(bodyStr))
 			}
 		}
 		// 上游明确报「模型不存在」时清理下架残留（同步标记 Delisted 保留的模型）
@@ -1775,15 +1789,17 @@ func callClineAPIWithAccountCtx(ctx context.Context, acc *Account, params map[st
 	return resp, acc, nil
 }
 
-func markAccountCooldown(acc *Account, until time.Time) {
+// coolModelShort 只给「本次请求用到的模型」写冷却，不动账号整体状态。
+// 用于连接抖动等非模型故障：避免一个模型的问题把整号停掉。
+func coolModelShort(acc *Account, params map[string]any, until time.Time) {
 	if acc == nil {
 		return
 	}
-	poolMu.Lock()
-	acc.Status = "cooldown"
-	acc.CooldownUntil = until
-	savePool()
-	poolMu.Unlock()
+	model, _ := params["model"].(string)
+	if model == "" {
+		return
+	}
+	setModelCooldown(acc, model, until)
 }
 
 func markAccountExpired(acc *Account) {
@@ -1825,14 +1841,6 @@ var (
 	cooldownMinRe    = regexp.MustCompile(`(?i)(\d+)\s*m(?:in(?:ute)?s?)?`)
 	cooldownSecRe    = regexp.MustCompile(`(?i)(\d+)\s*s(?:ec(?:ond)?s?)?`)
 )
-
-// parseQuotaCooldown 只在响应明确给出该账号的恢复时间时返回 true。
-func parseQuotaCooldown(body string) (time.Time, bool) {
-	if !cooldownPhraseRe.MatchString(body) {
-		return time.Time{}, false
-	}
-	return parseCooldownUntil(body), true
-}
 
 func parseCooldownUntil(body string) time.Time {
 	phrase := body
