@@ -126,6 +126,15 @@ func applyPlanToAccount(acc *Account, tier string, plan *clinePlanResponse) {
 		acc.PlanActive = false
 		acc.PlanPeriodEnd = time.Time{}
 	}
+	// 确认为 pass 时清掉该号上的陈旧模型冷却：这些冷却多半来自「层级未知时期」
+	// 的 403 ENTITLEMENT 误判（例如整池探测时把有订阅的号也判成无权限）。
+	// 层级判定已经推翻那个结论，继续留着只会让付费模型一直不可用。
+	// 真实的 429 配额冷却会由后续请求重新建立。
+	if normalizeTier(tier) == tierPass && len(acc.ModelCooldowns) > 0 {
+		log.Printf("tier detect: %s confirmed pass, clearing %d stale model cooldown(s)",
+			truncateEmail(acc.Email), len(acc.ModelCooldowns))
+		acc.ModelCooldowns = nil
+	}
 	poolMu.Unlock()
 }
 
