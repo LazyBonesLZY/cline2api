@@ -2115,6 +2115,149 @@ async function loadAccounts() {
   } catch (e) { toast(t('加载账号失败: ') + e.message, 'error'); }
 }
 
+// 分页器：页码按钮 + 总数（total 为缓存列表长度）
+function renderAccountPager(total) {
+  const pager = _('accountPager');
+  if (!pager) return;
+  const totalPages = Math.max(1, Math.ceil(total / _accPageSize));
+  if (totalPages <= 1 && total <= _accPageSize) { pager.style.display = 'none'; return; }
+  pager.style.display = 'flex';
+  pager.innerHTML =
+    '<span style="font-size:12px;color:var(--text2)">' + t('共') + ' ' + total + ' ' + t('个账号 · 每页') + ' ' + _accPageSize + '</span>' +
+    '<div style="display:flex;gap:6px;align-items:center">' +
+      '<button class="btn btn-sm" ' + (_accPage <= 1 ? 'disabled' : '') + ' onclick="accGotoPage(' + (_accPage - 1) + ')">‹</button>' +
+      '<span style="font-size:12px" class="mono">' + _accPage + ' / ' + totalPages + '</span>' +
+      '<button class="btn btn-sm" ' + (_accPage >= totalPages ? 'disabled' : '') + ' onclick="accGotoPage(' + (_accPage + 1) + ')">›</button>' +
+    '</div>';
+}
+
+function accGotoPage(p) {
+  _accPage = p;
+  loadAccounts();
+}
+
+// 勾选单个账号（跨页保持）
+function onSelAccount(id, checked) {
+  if (checked) _checkedAccounts.add(id);
+  else _checkedAccounts.delete(id);
+  updateSelCount();
+}
+
+// 全选/全不选当前页：优先用缓存列表；缓存为空（刚删除/导出后尚未刷新）时
+// 退回当前渲染行上的勾选框（从 onchange="onSelAccount('id',...)" 解析账号 ID）。
+function toggleAllAccountSel(box) {
+  const list = filteredAccountList();
+  const totalPages = Math.max(1, Math.ceil(list.length / _accPageSize));
+  const p = Math.min(_accPage, totalPages);
+  const chunk = list.slice((p - 1) * _accPageSize, p * _accPageSize);
+  if (chunk.length) {
+    chunk.forEach(a => {
+      if (box.checked) _checkedAccounts.add(a.accountId);
+      else _checkedAccounts.delete(a.accountId);
+    });
+    updateSelCount();
+    loadAccounts();
+    return;
+  }
+  const boxes = document.querySelectorAll('#accountTableBody input[type="checkbox"][onchange*="onSelAccount"]');
+  if (!boxes.length) { loadAccounts(); return; }
+  boxes.forEach(cb => {
+    const m = (cb.getAttribute('onchange') || '').match(/onSelAccount\('([^']+)'/);
+    if (!m) return;
+    cb.checked = box.checked;
+    if (box.checked) _checkedAccounts.add(m[1]);
+    else _checkedAccounts.delete(m[1]);
+  });
+  updateSelCount();
+}
+
+// 勾选计数徽标：同时根据当前页是否全部勾选来同步“全选”框，避免勾上后被强制重置
+function updateSelCount() {
+  const n = _checkedAccounts.size;
+  const sel = _('selCount'), del = _('delCount'), reset = _('resetCount'), all = _('accSelAll');
+  if (sel) sel.textContent = n ? ' (' + n + ')' : '';
+  if (del) del.textContent = n ? ' (' + n + ')' : '';
+  if (reset) reset.textContent = n ? ' (' + n + ')' : '';
+  if (all) {
+    const list = filteredAccountList();
+    const totalPages = Math.max(1, Math.ceil(list.length / _accPageSize));
+    const p = Math.min(_accPage, totalPages);
+    const chunk = list.slice((p - 1) * _accPageSize, p * _accPageSize);
+    all.checked = chunk.length > 0 && chunk.every(a => _checkedAccounts.has(a.accountId));
+  }
+}
+
+// 导出勾选的账号（POST /accounts/export {ids}，未勾选时提示）
+async function exportSelectedAccounts() {
+  const ids = [..._checkedAccounts];
+  if (!ids.length) { toast(t('请先勾选要导出的账号'), 'info'); return; }
+  try {
+    const res = await fetch(API + '/accounts/export', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: ids })
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'cline-accounts-export.json';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    toast(t('已导出 ') + ids.length + t(' 个账号'), 'success');
+  } catch (e) { toast(t('导出失败: ') + e.message, 'error'); }
+}
+
+// 删除勾选的账号（逐个调用现有删除接口，带确认）
+// 重置勾选的账号（逐个调用现有重置接口，清除冷却/失败计数）
+async function resetSelectedAccounts(btn) {
+  const ids = [..._checkedAccounts];
+  if (!ids.length) { toast(t('请先勾选要重置的账号'), 'info'); return; }
+  if (!confirm(t('确认重置选中的 ') + ids.length + t(' 个账号？（清除冷却与失败计数）'))) return;
+  const orig = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="loading"></span> ' + t('重置中...'); }
+  let ok = 0, fail = 0;
+  for (const id of ids) {
+    try { await api('POST', '/accounts/reset', { accountId: id }); ok++; }
+    catch (e) { fail++; }
+  }
+  _checkedAccounts.clear();
+  if (btn) { btn.disabled = false; btn.innerHTML = orig; }
+  if (fail) toast(t('已重置 ') + ok + t(' 个，失败 ') + fail + t(' 个'), 'error');
+  else toast(t('已重置 ') + ok + t(' 个账号'), 'success');
+  await loadAccounts();
+}
+
+async function deleteSelectedAccounts(btn) {
+  const ids = [..._checkedAccounts];
+  if (!ids.length) { toast(t('请先勾选要删除的账号'), 'info'); return; }
+  if (!confirm(t('确认删除选中的 ') + ids.length + t(' 个账号？此操作不可恢复'))) return;
+  const orig = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="loading"></span> ' + t('删除中...'); }
+  let ok = 0, fail = 0;
+  for (const id of ids) {
+    try { await api('POST', '/accounts/delete', { accountId: id }); ok++; }
+    catch (e) { fail++; }
+  }
+  _checkedAccounts.clear();
+  if (btn) { btn.disabled = false; btn.innerHTML = orig; }
+  if (fail) toast(t('已删除 ') + ok + t(' 个，失败 ') + fail + t(' 个失败'), 'error');
+  else toast(t('已删除 ') + ok + t(' 个账号'), 'success');
+  await loadAccounts();
+  await loadStats();
+}
+
+// 表格时间列：日期一行、时间灰色小字一行，固定不折行
+function fmtDateTime2(v) {
+  if (!v) return '<span style="color:var(--text3)">-</span>';
+  const d = new Date(v);
+  return '<div style="white-space:nowrap">' + d.toLocaleDateString(LC()) + '</div>' +
+    '<div style="white-space:nowrap;font-size:10px;color:var(--text3)">' + d.toLocaleTimeString(LC()) + '</div>';
+}
+
 // 展开/收起账号的模型统计子行（表格视图）
 function toggleModelRow(id, btn) {
   const row = _('modelRow-' + id);
